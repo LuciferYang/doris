@@ -1,0 +1,100 @@
+# Fork-only helper: build Doris on an x86-64 runner, bring up a doris-compose
+# cluster, and regenerate regression .out golden files that cannot be produced
+# on an Apple Silicon dev box (the x86-64 BE segfaults under Docker emulation
+# there). Not intended for upstream; lives on the ci/zonemap-genout branch.
+name: zonemap genOut
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or SHA to build and gen-out (the code under test)"
+        required: true
+        default: "feat/cross-column-zonemap-pruning"
+      suite:
+        description: "Suite dir under regression-test/suites, passed to -d (e.g. query_p0/expr_zonemap)"
+        required: true
+        default: "query_p0/expr_zonemap"
+      force:
+        description: "Use -forceGenOut (delete+regenerate) instead of -genOut"
+        type: boolean
+        default: true
+
+jobs:
+  genout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Checkout code under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 1
+          submodules: false
+
+      - name: Set up JDK 17 for the regression framework
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build FE + BE inside the build-env image
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/doris" \
+            -w /doris \
+            -e DORIS_HOME=/doris \
+            -e DORIS_THIRDPARTY=/var/local/thirdparty \
+            -e JAVA_HOME=/usr/lib/jvm/jdk-17.0.2 \
+            apache/doris:build-env-ldb-toolchain-latest \
+            bash -lc 'export PATH=/var/local/ldb-toolchain/bin:$JAVA_HOME/bin:$PATH; bash build.sh --fe --be -j "$(nproc)"'
+          sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}"
+          ls -la output/fe output/be/lib/doris_be
+
+      - name: Build doris-compose image
+        run: docker build -f docker/runtime/doris-compose/Dockerfile -t doris-genout:ci .
+
+      - name: Install doris-compose deps
+        run: |
+          python3 -m venv /tmp/dcvenv
+          /tmp/dcvenv/bin/pip install -q docker "PyYAML>=6" filelock jsonpickle \
+            prettytable pymysql python-dateutil "requests>=2.31.0"
+
+      - name: Bring up 1FE + 1BE cluster
+        run: |
+          cd docker/runtime/doris-compose
+          /tmp/dcvenv/bin/python doris-compose.py up genout doris-genout:ci \
+            --add-fe-num 1 --add-be-num 1 --wait-timeout 500
+          /tmp/dcvenv/bin/python doris-compose.py config genout "${{ github.workspace }}" -q
+
+      - name: Gen-out the suite
+        run: |
+          FLAG="-genOut"
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then FLAG="-forceGenOut"; fi
+          bash run-regression-test.sh --run -d "${{ github.event.inputs.suite }}" \
+            "$FLAG" -times 1 -parallel 1 -suiteParallel 1 -actionParallel 2
+
+      - name: Upload generated .out
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genout-data
+          path: regression-test/data/${{ github.event.inputs.suite }}/**
+          if-no-files-found: warn
+
+      - name: Upload cluster logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-logs
+          path: |
+            /tmp/doris/genout/**/log/**
+            regression-test/log/**
+          if-no-files-found: ignore
