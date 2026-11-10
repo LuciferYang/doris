@@ -21,6 +21,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
+#include <optional>
 #include <vector>
 
 #include "common/status.h"
@@ -54,7 +56,7 @@ public:
     Scanner(RuntimeState* state, ScanLocalStateBase* local_state, int64_t limit,
             RuntimeProfile* profile);
 
-    //only used for FileScanner read one line.
+    // Standalone scanner context used by external row fetches and reader tests.
     Scanner(RuntimeState* state, RuntimeProfile* profile)
             : _state(state), _limit(1), _profile(profile), _total_rf_num(0), _has_prepared(false) {
         DorisMetrics::instance()->scanner_cnt->increment(1);
@@ -97,7 +99,19 @@ public:
     // eg, for file scanner, return the current file path.
     virtual std::string get_current_scan_range_name() { return "not implemented"; }
 
+#ifdef BE_TEST
+    static uint64_t TEST_build_condition_cache_digest(uint64_t seed,
+                                                      const VExprContextSPtrs& conjuncts);
+#endif
+
 protected:
+    // Rebuild the condition-cache digest from the scanner's current conjunct snapshot. The local
+    // state's digest is used only as a safety gate: zero means condition cache was disabled during
+    // scan-node open (for example by TopN or an expression without a reliable digest).
+    uint64_t _current_condition_cache_digest() const;
+    static uint64_t _build_condition_cache_digest(uint64_t seed,
+                                                  const VExprContextSPtrs& conjuncts);
+
     virtual Status _prepare_impl() {
         _has_prepared = true;
         return Status::OK();
@@ -111,6 +125,10 @@ protected:
     // Subclass should implement this to return data.
     virtual Status _get_block_impl(RuntimeState* state, Block* block, bool* eof) = 0;
 
+    virtual bool _can_merge_padding_blocks(const Block& /*left*/, const Block& /*right*/) const {
+        return true;
+    }
+
     Status _merge_padding_block() {
         if (_padding_block.empty()) {
             _padding_block.swap(_origin_block);
@@ -122,8 +140,24 @@ protected:
         return Status::OK();
     }
 
+    // True once scanners of this operator have produced the whole shared LIMIT. The scanner then
+    // stops reading but does not report EOS for it: EOS means the underlying read is exhausted,
+    // while the LIMIT is applied by the scan operator, which stops the scanners once it holds
+    // enough rows.
+    bool _shared_scan_limit_exhausted() const {
+        return _shared_scan_limit != nullptr &&
+               _shared_scan_limit->load(std::memory_order_acquire) <= 0;
+    }
+
     // Update the counters before closing this scanner
     virtual void _collect_profile_before_close();
+
+    // Whether rows filtered/unselected by this scanner should be reported to the load
+    // counters in RuntimeState. Only the scanner reading the load source data should
+    // report, otherwise rows filtered by query predicates (e.g. in INSERT INTO ... SELECT
+    // or DELETE FROM ... WHERE) would be mixed into load counters and make
+    // num_rows_load_success() negative.
+    virtual bool _should_update_load_counters() const { return _is_load; }
 
     // Check if scanner is already closed, if not, mark it as closed.
     // Returns true if the scanner was successfully marked as closed (first time).
@@ -131,7 +165,7 @@ protected:
     bool _try_close();
 
     // Filter the output block finally.
-    Status _filter_output_block(Block* block);
+    virtual Status _filter_output_block(Block* block);
 
     Status _do_projections(Block* origin_block, Block* output_block);
 
@@ -186,9 +220,15 @@ public:
         return doris::TabletStorageType::STORAGE_TYPE_REMOTE;
     }
 
-    // Returns true if this scanner's partition has been pruned by a runtime filter.
-    // Overridden by OlapScanner to check partition pruning state.
-    virtual bool check_partition_pruned() const { return false; }
+    // Returns true if this scanner's scan range has been pruned by a runtime filter.
+    virtual bool is_pruned_by_runtime_filter() const { return false; }
+
+    // Releases resources owned by a scanner that runtime-filter pruning makes unnecessary before
+    // open(). The scanner will not be scheduled again after this call.
+    virtual void release_unopened_resources() {
+        DORIS_CHECK(!_is_open);
+        _has_prepared = false;
+    }
 
     bool need_to_close() const { return _need_to_close; }
 
@@ -221,7 +261,8 @@ protected:
     RuntimeProfile* _profile = nullptr;
 
     const TupleDescriptor* _output_tuple_desc = nullptr;
-    const RowDescriptor* _output_row_descriptor = nullptr;
+    std::optional<std::reference_wrapper<const RowDescriptor>> _projection_output_row_descriptor;
+    bool _has_projection = false;
 
     // If _input_tuple_desc is set, the scanner will read data into
     // this _input_block first, then convert to the output block.
@@ -277,7 +318,7 @@ protected:
     int64_t _per_scanner_open_timer = 0;
     int64_t _projection_timer = 0;
 
-    bool _should_stop = false;
+    std::atomic_bool _should_stop = false;
 
     // Cached pointer to ScanOperator's remaining-limit counter. Null when
     // this scanner is on the topn path or the query has no LIMIT.

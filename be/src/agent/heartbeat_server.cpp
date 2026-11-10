@@ -17,6 +17,7 @@
 
 #include "agent/heartbeat_server.h"
 
+#include <bvar/bvar.h>
 #include <gen_cpp/HeartbeatService.h>
 #include <gen_cpp/HeartbeatService_types.h>
 #include <gen_cpp/Types_types.h>
@@ -51,6 +52,13 @@ class TProcessor;
 } // namespace apache
 
 namespace doris {
+
+namespace {
+// Store the sampled value independently: bvar's sampler also runs before cluster
+// initialization and after cluster teardown.
+// ATTN(changelog-rename): formerly "row_binlog_ttl_reference_tso"
+bvar::Status<int64_t> changelog_ttl_reference("changelog_ttl_reference_tso", 0);
+} // namespace
 
 HeartbeatServer::HeartbeatServer(ClusterInfo* cluster_info)
         : _engine(ExecEnv::GetInstance()->storage_engine()),
@@ -95,6 +103,8 @@ void HeartbeatServer::heartbeat(THeartbeatResult& heartbeat_result,
         heartbeat_result.backend_info.__set_fragment_last_active_time(
                 get_fragment_last_active_time());
         heartbeat_result.backend_info.__set_be_mem(MemInfo::physical_mem());
+        // Reader enum support cannot be inferred from a release version during rolling upgrades.
+        heartbeat_result.backend_info.__set_supports_paimon_rust_reader(true);
     }
     watch.stop();
     if (watch.elapsed_time() > 1000L * 1000L * 1000L) {
@@ -217,10 +227,9 @@ Status HeartbeatServer::_heartbeat(const TMasterInfo& master_info) {
     if (master_info.__isset.token) {
         if (_cluster_info->token == "") {
             _cluster_info->token = master_info.token;
-            LOG(INFO) << "get token. token: " << _cluster_info->token;
+            LOG(INFO) << "get token";
         } else if (_cluster_info->token != master_info.token) {
-            return Status::InternalError("invalid token. local: {}, master: {}",
-                                         _cluster_info->token, master_info.token);
+            return Status::InternalError("invalid token");
         }
     }
 
@@ -300,10 +309,16 @@ Status HeartbeatServer::_heartbeat(const TMasterInfo& master_info) {
         LOG(INFO) << "set config cloud_unique_id " << master_info.cloud_unique_id << " " << st;
     }
 
-    if (master_info.__isset.cloud_cluster_info &&
-        master_info.cloud_cluster_info.__isset.isStandby) {
+    if (master_info.__isset.cloud_cluster_info) {
         auto* cloud_cluster_info = static_cast<CloudClusterInfo*>(_cluster_info);
-        cloud_cluster_info->set_is_in_standby(master_info.cloud_cluster_info.isStandby);
+        if (master_info.cloud_cluster_info.__isset.isStandby) {
+            cloud_cluster_info->set_is_in_standby(master_info.cloud_cluster_info.isStandby);
+        }
+        if (master_info.cloud_cluster_info.__isset.cloud_compute_group_id &&
+            !master_info.cloud_cluster_info.cloud_compute_group_id.empty()) {
+            cloud_cluster_info->set_cloud_compute_group_id(
+                    master_info.cloud_cluster_info.cloud_compute_group_id);
+        }
     }
 
     if (master_info.__isset.tablet_report_inactive_duration_ms) {
@@ -314,13 +329,18 @@ Status HeartbeatServer::_heartbeat(const TMasterInfo& master_info) {
     if (master_info.__isset.auth_token) {
         if (_cluster_info->curr_auth_token == "") {
             _cluster_info->curr_auth_token = master_info.auth_token;
-            LOG(INFO) << "set new auth token: " << master_info.auth_token;
+            LOG(INFO) << "set new auth token";
         } else if (_cluster_info->curr_auth_token != master_info.auth_token) {
-            LOG(INFO) << "last auth token: " << _cluster_info->last_auth_token
-                      << "set new auth token: " << master_info.auth_token;
+            LOG(INFO) << "update auth token";
             _cluster_info->last_auth_token = _cluster_info->curr_auth_token;
             _cluster_info->curr_auth_token = master_info.auth_token;
         }
+    }
+
+    // A delayed epoch from the same master address must not authorize cleanup.
+    if (master_info.epoch == _fe_epoch && master_info.__isset.changelog_ttl_reference_tso) {
+        _cluster_info->advance_changelog_ttl_reference_tso(master_info.changelog_ttl_reference_tso);
+        changelog_ttl_reference.set_value(_cluster_info->changelog_ttl_reference_tso());
     }
 
     if (need_report) {

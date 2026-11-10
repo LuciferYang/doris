@@ -20,7 +20,6 @@ package org.apache.doris.httpv2.rest.manager;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.AuthenticationException;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.proc.CurrentQueryStatisticsProcDir;
@@ -28,7 +27,9 @@ import org.apache.doris.common.proc.ProcResult;
 import org.apache.doris.common.profile.ProfileManager;
 import org.apache.doris.common.profile.ProfileManager.ProfileElement;
 import org.apache.doris.common.profile.SummaryProfile;
+import org.apache.doris.common.util.HttpURLUtil;
 import org.apache.doris.common.util.NetUtils;
+import org.apache.doris.common.util.QueryStatisticsFormatter;
 import org.apache.doris.httpv2.controller.BaseController.ActionAuthorizationInfo;
 import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
 import org.apache.doris.httpv2.rest.RestBaseController;
@@ -196,7 +197,7 @@ public class QueryProfileAction extends RestBaseController {
         // add node information
         for (List<String> query : queries) {
             query.set(1, NetUtils.getHostPortInAccessibleFormat(Env.getCurrentEnv().getSelfNode().getHost(),
-                    Config.http_port));
+                    HttpURLUtil.getHttpPort()));
         }
 
         if (!Strings.isNullOrEmpty(search)) {
@@ -213,6 +214,34 @@ public class QueryProfileAction extends RestBaseController {
         }
 
         return ResponseEntityBuilder.ok(new NodeAction.NodeInfo(QUERY_TITLE_NAMES, queries));
+    }
+
+    // FE versions can differ during a rolling upgrade. Match columns by name rather than
+    // concatenating rows by position; older FEs have neither remote-spill column.
+    static List<List<String>> normalizeCurrentQueryRows(NodeAction.NodeInfo nodeInfo) {
+        List<String> localTitles = Lists.newArrayList(CurrentQueryStatisticsProcDir.TITLE_NAMES);
+        localTitles.add(0, FRONTEND);
+        List<Integer> indexes = Lists.newArrayListWithCapacity(localTitles.size());
+        for (String title : localTitles) {
+            int index = nodeInfo.getColumnNames().indexOf(title);
+            if (index < 0 && !title.equals("SpillWriteBytesToRemoteStorage")
+                    && !title.equals("SpillReadBytesFromRemoteStorage")) {
+                throw new IllegalArgumentException("missing current-query column: " + title);
+            }
+            indexes.add(index);
+        }
+        List<List<String>> normalized = Lists.newArrayListWithCapacity(nodeInfo.getRows().size());
+        for (List<String> row : nodeInfo.getRows()) {
+            if (row.size() != nodeInfo.getColumnNames().size()) {
+                throw new IllegalArgumentException("current-query row width does not match column names");
+            }
+            List<String> values = Lists.newArrayListWithCapacity(localTitles.size());
+            for (int index : indexes) {
+                values.add(index < 0 ? QueryStatisticsFormatter.getScanBytes(0) : row.get(index));
+            }
+            normalized.add(values);
+        }
+        return normalized;
     }
 
     // Returns the sql for the specified query id.
@@ -373,7 +402,15 @@ public class QueryProfileAction extends RestBaseController {
      *  Query qError.
      */
     @RequestMapping(path = "/qerror/{id}", method = RequestMethod.GET)
-    public ResponseEntity<String> getStats(@PathVariable(value = "id") String id) {
+    public Object getStats(HttpServletRequest request, HttpServletResponse response,
+            @PathVariable(value = "id") String id) {
+        executeCheckPassword(request, response);
+        try {
+            checkAuthByUserAndQueryId(id);
+        } catch (AuthenticationException e) {
+            return ResponseEntityBuilder.badRequest(e.getMessage());
+        }
+
         ProfileElement profile = ProfileManager.getInstance().findProfileElementObject(id);
         if (profile == null) {
             return ResponseEntityBuilder.notFound(null);
@@ -445,7 +482,7 @@ public class QueryProfileAction extends RestBaseController {
     private void checkAuthByUserAndQueryId(String queryId) throws AuthenticationException {
         String user = ConnectContext.get().getCurrentUserIdentity().getQualifiedUser();
         if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
-            ProfileManager.getInstance().checkAuthByUserAndQueryId(user, queryId);
+            ProfileManager.getInstance().checkAuthByUserAndProfileId(user, queryId);
         }
     }
 
@@ -475,7 +512,7 @@ public class QueryProfileAction extends RestBaseController {
                 try {
                     NodeAction.NodeInfo nodeInfo = GsonUtils.GSON.fromJson(data, new TypeToken<NodeAction.NodeInfo>() {
                     }.getType());
-                    queries.addAll(nodeInfo.getRows());
+                    queries.addAll(normalizeCurrentQueryRows(nodeInfo));
                 } catch (Exception e) {
                     LOG.warn("parse query info error: {}", data, e);
                 }
@@ -579,6 +616,8 @@ public class QueryProfileAction extends RestBaseController {
         public long scanBytesFromRemoteStorage;
         public long spillWriteBytesToLocalStorage;
         public long spillReadBytesFromLocalStorage;
+        public long spillWriteBytesToRemoteStorage;
+        public long spillReadBytesFromRemoteStorage;
 
         public QueryStatistics(TQueryStatistics queryStatistics) {
             this.scanRows = queryStatistics.getScanRows();
@@ -593,6 +632,8 @@ public class QueryProfileAction extends RestBaseController {
             this.scanBytesFromRemoteStorage = queryStatistics.getScanBytesFromRemoteStorage();
             this.spillWriteBytesToLocalStorage = queryStatistics.getSpillWriteBytesToLocalStorage();
             this.spillReadBytesFromLocalStorage = queryStatistics.getSpillReadBytesFromLocalStorage();
+            this.spillWriteBytesToRemoteStorage = queryStatistics.getSpillWriteBytesToRemoteStorage();
+            this.spillReadBytesFromRemoteStorage = queryStatistics.getSpillReadBytesFromRemoteStorage();
         }
     }
 }

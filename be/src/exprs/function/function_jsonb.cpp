@@ -59,7 +59,6 @@
 #include "exprs/function/simple_function_factory.h"
 #include "exprs/function_context.h"
 #include "util/jsonb_document.h"
-#include "util/jsonb_stream.h"
 #include "util/jsonb_utils.h"
 #include "util/jsonb_writer.h"
 #include "util/simd/bits.h"
@@ -141,20 +140,21 @@ public:
         if (scope == FunctionContext::FunctionStateScope::FRAGMENT_LOCAL) {
             std::shared_ptr<FunctionJsonbParseState> state =
                     std::make_shared<FunctionJsonbParseState>();
-            context->set_function_state(FunctionContext::FRAGMENT_LOCAL, state);
+            context->set_function_state(FunctionContext::FunctionStateScope::FRAGMENT_LOCAL, state);
         }
         if constexpr (parse_error_handle_mode == JsonbParseErrorMode::RETURN_VALUE) {
             if (scope == FunctionContext::FunctionStateScope::FRAGMENT_LOCAL) {
-                auto* state = reinterpret_cast<FunctionJsonbParseState*>(
-                        context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+                auto* state =
+                        reinterpret_cast<FunctionJsonbParseState*>(context->get_function_state(
+                                FunctionContext::FunctionStateScope::FRAGMENT_LOCAL));
                 if (state) {
                     if (context->get_num_args() == 2) {
                         if (context->is_col_constant(1)) {
-                            const auto default_value_col = context->get_constant_col(1)->column_ptr;
-                            if (default_value_col->is_null_at(0)) {
+                            const auto& default_value_col = context->get_constant_col(1)->column();
+                            if (default_value_col.is_null_at(0)) {
                                 state->default_is_null = true;
                             } else {
-                                const auto& default_value = default_value_col->get_data_at(0);
+                                const auto& default_value = default_value_col.get_data_at(0);
 
                                 state->default_value = default_value;
                                 state->has_const_default_value = true;
@@ -233,8 +233,8 @@ public:
         const ColumnString* default_value_str_col = nullptr;
         const NullMap* default_value_nullmap = nullptr;
         if constexpr (parse_error_handle_mode == JsonbParseErrorMode::RETURN_VALUE) {
-            auto* state = reinterpret_cast<FunctionJsonbParseState*>(
-                    context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+            auto* state = reinterpret_cast<FunctionJsonbParseState*>(context->get_function_state(
+                    FunctionContext::FunctionStateScope::FRAGMENT_LOCAL));
             if (state && state->has_const_default_value) {
                 constant_default_value = state->default_value;
                 default_value_null_const = state->default_is_null;
@@ -863,7 +863,6 @@ private:
     static ALWAYS_INLINE void inner_loop_impl(JsonbWriter* writer, size_t i,
                                               ColumnString::Chars& res_data,
                                               ColumnString::Offsets& res_offsets, NullMap& null_map,
-                                              std::unique_ptr<JsonbToJson>& formater,
                                               const char* l_raw, size_t l_size, JsonbPath& path) {
         // doc is NOT necessary to be deleted since JsonbDocument will not allocate memory
         const JsonbDocument* doc = nullptr;
@@ -924,7 +923,6 @@ public:
         res_offsets.resize(input_rows_count);
 
         auto writer = std::make_unique<JsonbWriter>();
-        std::unique_ptr<JsonbToJson> formater;
 
         // reuseable json path list, espacially for const path
         std::vector<JsonbPath> json_path_list;
@@ -988,8 +986,8 @@ public:
                 }
 
                 writer->reset();
-                inner_loop_impl(writer.get(), i, res_data, res_offsets, null_map, formater, l_raw,
-                                l_size, json_path_list[0]);
+                inner_loop_impl(writer.get(), i, res_data, res_offsets, null_map, l_raw, l_size,
+                                json_path_list[0]);
             } else { // will make array string to user
                 writer->reset();
                 bool has_value = false;
@@ -1054,8 +1052,6 @@ public:
         size_t input_rows_count = loffsets.size();
         res_offsets.resize(input_rows_count);
 
-        std::unique_ptr<JsonbToJson> formater;
-
         JsonbWriter writer;
         for (size_t i = 0; i < input_rows_count; ++i) {
             if (l_null_map && (*l_null_map)[i]) {
@@ -1082,8 +1078,7 @@ public:
             }
 
             writer.reset();
-            inner_loop_impl(&writer, i, res_data, res_offsets, null_map, formater, l_raw, l_size,
-                            path);
+            inner_loop_impl(&writer, i, res_data, res_offsets, null_map, l_raw, l_size, path);
         } //for
         return Status::OK();
     } //function
@@ -1094,8 +1089,6 @@ public:
                                 ColumnString::Offsets& res_offsets, NullMap& null_map) {
         size_t input_rows_count = loffsets.size();
         res_offsets.resize(input_rows_count);
-
-        std::unique_ptr<JsonbToJson> formater;
 
         JsonbPath path;
         if (!path.seek(rdata.data, rdata.size)) {
@@ -1114,8 +1107,7 @@ public:
             const char* l_raw = reinterpret_cast<const char*>(&ldata[loffsets[i - 1]]);
 
             writer.reset();
-            inner_loop_impl(&writer, i, res_data, res_offsets, null_map, formater, l_raw, l_size,
-                            path);
+            inner_loop_impl(&writer, i, res_data, res_offsets, null_map, l_raw, l_size, path);
         } //for
         return Status::OK();
     } //function
@@ -1127,8 +1119,6 @@ public:
                                 NullMap& null_map) {
         size_t input_rows_count = roffsets.size();
         res_offsets.resize(input_rows_count);
-
-        std::unique_ptr<JsonbToJson> formater;
 
         JsonbWriter writer;
 
@@ -1149,8 +1139,8 @@ public:
             }
 
             writer.reset();
-            inner_loop_impl(&writer, i, res_data, res_offsets, null_map, formater, ldata.data,
-                            ldata.size, path);
+            inner_loop_impl(&writer, i, res_data, res_offsets, null_map, ldata.data, ldata.size,
+                            path);
         } //for
         return Status::OK();
     } //function
@@ -1397,8 +1387,10 @@ struct JsonbLengthUtil {
         }
 
         for (size_t i = 0; i < input_rows_count; ++i) {
-            if (jsonb_data_column->is_null_at(i) || path_column->is_null_at(i) ||
-                (jsonb_data_column->get_data_at(i).size == 0)) {
+            const auto jsonb_index = index_check_const(i, jsonb_data_const);
+            if (jsonb_data_column->is_null_at(jsonb_index) ||
+                path_column->is_null_at(index_check_const(i, is_const)) ||
+                (jsonb_data_column->get_data_at(jsonb_index).size == 0)) {
                 null_map->get_data()[i] = 1;
                 res->insert_data(nullptr, 0);
                 continue;
@@ -1412,7 +1404,7 @@ struct JsonbLengthUtil {
                             std::string_view(path_value.data, path_value.size));
                 }
             }
-            auto jsonb_value = jsonb_data_column->get_data_at(i);
+            auto jsonb_value = jsonb_data_column->get_data_at(jsonb_index);
             // doc is NOT necessary to be deleted since JsonbDocument will not allocate memory
             const JsonbDocument* doc = nullptr;
             RETURN_IF_ERROR(JsonbDocument::checkAndCreateDocument(jsonb_value.data,
@@ -1511,7 +1503,7 @@ struct JsonbContainsUtil {
 
         for (size_t i = 0; i < input_rows_count; ++i) {
             if (jsonb_data1_column->is_null_at(i) || jsonb_data2_column->is_null_at(i) ||
-                path_column->is_null_at(i)) {
+                path_column->is_null_at(index_check_const(i, is_const))) {
                 null_map->get_data()[i] = 1;
                 res->insert_data(nullptr, 0);
                 continue;
@@ -2049,10 +2041,7 @@ public:
                     DCHECK_GT(legs_count, 0);
                     for (size_t j = 0; j + 1 < legs_count; ++j) {
                         auto* current_leg = json_path[path_index].get_leg_from_leg_vector(j);
-                        std::unique_ptr<leg_info> leg = std::make_unique<leg_info>(
-                                current_leg->leg_ptr, current_leg->leg_len,
-                                current_leg->array_index, current_leg->type);
-                        new_path.add_leg_to_leg_vector(std::move(leg));
+                        new_path.add_leg_to_leg_vector(std::make_unique<leg_info>(*current_leg));
                     }
 
                     if (!build_parents_by_path(json_documents[row_idx]->getValue(), new_path,
@@ -2065,6 +2054,12 @@ public:
                         legs_count > 0
                                 ? json_path[path_index].get_leg_from_leg_vector(legs_count - 1)
                                 : nullptr;
+                // A member leg names an object key and never an array element, so inserting it
+                // into an array leaves the document unchanged (as MySQL does). Otherwise its
+                // default array_index (0) would overwrite the first element.
+                if (!replace && parents.back()->isArray() && last_leg->type == MEMBER_CODE) {
+                    continue;
+                }
                 RETURN_IF_ERROR(write_json_value(json_documents[row_idx]->getValue(), parents, 0,
                                                  json_value[value_index], replace, last_leg,
                                                  writer));
@@ -2117,15 +2112,10 @@ public:
 
         JsonbPath current;
         auto* current_leg = path.get_leg_from_leg_vector(index);
-        std::unique_ptr<leg_info> leg =
-                std::make_unique<leg_info>(current_leg->leg_ptr, current_leg->leg_len,
-                                           current_leg->array_index, current_leg->type);
-        current.add_leg_to_leg_vector(std::move(leg));
+        current.add_leg_to_leg_vector(std::make_unique<leg_info>(*current_leg));
 
         auto find_result = root->findValue(current);
         if (!find_result.value) {
-            std::string path_string;
-            current.to_string(&path_string);
             return false;
         } else if (find_result.value == root) {
             return true;
@@ -2168,8 +2158,9 @@ public:
         if (root->isArray()) {
             writer.writeStartArray();
             const auto* array_val = root->unpack<ArrayVal>();
-            for (int i = 0; i != array_val->numElem(); ++i) {
-                auto* it = array_val->get(i);
+            int i = 0;
+            for (auto iter = array_val->begin(); iter < array_val->end(); ++iter, ++i) {
+                const auto* it = &*iter;
 
                 if (is_last_parent && last_leg->array_index == i) {
                     value_written = true;
@@ -2233,10 +2224,15 @@ public:
 
                 if (is_last_parent && !value_written) {
                     value_written = true;
-                    writer.writeStartObject();
+                    // The current object is already open above and is waiting for a key, so the
+                    // new member must be appended to it directly. Opening another object here
+                    // would be rejected by the writer, and closing one here would end the
+                    // current object early; the writeEndObject below would then close its
+                    // parent as well, silently dropping every member that follows the current
+                    // one. For example, {"a":{},"b":2} with path $.a.c used to return
+                    // {"a":{"c":1}} instead of {"a":{"c":1},"b":2}.
                     writer.writeKey(last_leg->leg_ptr, static_cast<uint8_t>(last_leg->leg_len));
                     writer.writeValue(value);
-                    writer.writeEndObject();
                 }
                 writer.writeEndObject();
 
@@ -2394,12 +2390,12 @@ private:
         } else if (element->isArray()) {
             const auto* array = element->unpack<ArrayVal>();
             bool find = false;
-            for (int i = 0; i < array->numElem(); ++i) {
-                auto leg = std::make_unique<leg_info>(nullptr, 0, i, ARRAY_CODE);
-                cur_path->add_leg_to_leg_vector(std::move(leg));
-                const auto* child_element = array->get(i);
+            int index = 0;
+            for (auto it = array->begin(); it < array->end(); ++it, ++index) {
                 // construct an array cell path leg.
-                find |= find_matches(child_element, one_match, state, cur_path, matches);
+                auto leg = std::make_unique<leg_info>(nullptr, 0, index, ARRAY_CODE);
+                cur_path->add_leg_to_leg_vector(std::move(leg));
+                find |= find_matches(&*it, one_match, state, cur_path, matches);
                 cur_path->pop_leg_from_leg_vector();
                 if (one_match && find) {
                     return true;
@@ -2446,7 +2442,7 @@ private:
         LikeState* state = nullptr;
         if (search_is_const) {
             state = reinterpret_cast<LikeState*>(
-                    context->get_function_state(FunctionContext::THREAD_LOCAL));
+                    context->get_function_state(FunctionContext::FunctionStateScope::THREAD_LOCAL));
         }
 
         bool is_one = false;
@@ -2538,14 +2534,14 @@ public:
     bool use_default_implementation_for_nulls() const override { return false; }
 
     Status open(FunctionContext* context, FunctionContext::FunctionStateScope scope) override {
-        if (scope != FunctionContext::THREAD_LOCAL) {
+        if (scope != FunctionContext::FunctionStateScope::THREAD_LOCAL) {
             return Status::OK();
         }
         if (context->is_col_constant(2)) {
             std::shared_ptr<LikeState> state = std::make_shared<LikeState>();
             state->is_like_pattern = true;
-            const auto pattern_col = context->get_constant_col(2)->column_ptr;
-            const auto& pattern = pattern_col->get_data_at(0);
+            const auto& pattern_col = context->get_constant_col(2)->column();
+            const auto& pattern = pattern_col.get_data_at(0);
             RETURN_IF_ERROR(
                     FunctionLike::construct_like_const_state(context, pattern, state, false));
             context->set_function_state(scope, state);
@@ -2712,8 +2708,6 @@ public:
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
                         uint32_t result, size_t input_rows_count) const override {
-        DORIS_CHECK_GE(arguments.size(), 2);
-
         // Check if arguments count is valid (json_doc + at least one path)
         if (arguments.size() < 2) {
             return Status::InvalidArgument("json_remove requires at least 2 arguments");
@@ -2820,7 +2814,6 @@ public:
             }
 
             std::vector<JsonbPath> paths;
-            std::vector<bool> path_constants_vec;
 
             for (size_t path_idx = 0; path_idx < path_columns.size(); ++path_idx) {
                 size_t idx = index_check_const(row_idx, path_constants[path_idx]);
@@ -2841,7 +2834,6 @@ public:
                 }
 
                 paths.push_back(std::move(path));
-                path_constants_vec.push_back(path_constants[path_idx]);
             }
 
             const JsonbValue* current_value = json_doc->getValue();

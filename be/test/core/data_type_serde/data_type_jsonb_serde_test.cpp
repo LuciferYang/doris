@@ -25,7 +25,9 @@
 #include <lz4/lz4.h>
 #include <streamvbyte.h>
 
+#include <array>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <type_traits>
@@ -35,9 +37,14 @@
 #include "core/data_type/common_data_type_serder_test.h"
 #include "core/data_type/common_data_type_test.h"
 #include "core/data_type/data_type.h"
+#include "core/data_type/data_type_array.h"
 #include "core/data_type/data_type_factory.hpp"
 #include "core/data_type/data_type_jsonb.h"
+#include "core/data_type/data_type_map.h"
 #include "core/data_type/data_type_nullable.h"
+#include "core/data_type/data_type_string.h"
+#include "core/data_type/data_type_struct.h"
+#include "core/string_buffer.hpp"
 #include "core/types.h"
 #include "storage/olap_common.h"
 #include "testutil/test_util.h"
@@ -215,7 +222,7 @@ TEST_F(DataTypeJsonbSerDeTest, serdes) {
             TimezoneUtils::load_timezones_to_cache();
             DataTypeSerDe::FormatOptions format_options;
             cctz::time_zone tz;
-            TimezoneUtils::find_cctz_time_zone("UTC", tz);
+            ASSERT_TRUE(TimezoneUtils::find_cctz_time_zone("UTC", tz));
             format_options.timezone = &tz;
             auto orc_batch =
                     std::make_unique<orc::StringVectorBatch>(row_count, *orc::getDefaultPool());
@@ -273,6 +280,206 @@ TEST_F(DataTypeJsonbSerDeTest, ArrowMemNotAligned) {
     cctz::time_zone tz;
     auto st = serde_jsonb->read_column_from_arrow(*column_jsonb, arr.get(), 0, 1, tz);
     EXPECT_TRUE(st.ok());
+}
+
+TEST_F(DataTypeJsonbSerDeTest, FixedSizeBinaryReadColumnFromArrowWithNonZeroStart) {
+    constexpr int64_t num_elements = 4;
+    constexpr int byte_width = 7;
+    auto data_buf_result = arrow::AllocateBuffer(num_elements * byte_width);
+    ASSERT_TRUE(data_buf_result.ok());
+    std::shared_ptr<arrow::Buffer> data_buf = std::move(data_buf_result.ValueOrDie());
+
+    auto* data = data_buf->mutable_data();
+    const std::array<std::string, num_elements> values = {"{\"a\":1}", "{\"b\":2}", "{\"c\":3}",
+                                                          "{\"d\":4}"};
+    for (int64_t i = 0; i < num_elements; ++i) {
+        memcpy(data + i * byte_width, values[i].data(), byte_width);
+    }
+
+    auto null_bitmap_result = arrow::AllocateBuffer(1);
+    ASSERT_TRUE(null_bitmap_result.ok());
+    std::shared_ptr<arrow::Buffer> null_bitmap = std::move(null_bitmap_result.ValueOrDie());
+    memset(null_bitmap->mutable_data(), 0, null_bitmap->size());
+    arrow::bit_util::ClearBit(null_bitmap->mutable_data(), 0);
+    arrow::bit_util::SetBit(null_bitmap->mutable_data(), 1);
+    arrow::bit_util::SetBit(null_bitmap->mutable_data(), 2);
+    arrow::bit_util::SetBit(null_bitmap->mutable_data(), 3);
+
+    auto type = std::make_shared<arrow::FixedSizeBinaryType>(byte_width);
+    auto arr = std::make_shared<arrow::FixedSizeBinaryArray>(type, num_elements, data_buf,
+                                                             null_bitmap, 1);
+
+    auto column = ColumnString::create();
+    cctz::time_zone tz;
+    auto st = serde_jsonb->read_column_from_arrow(*column, arr.get(), 1, 4, tz);
+    ASSERT_TRUE(st.ok());
+    ASSERT_EQ(column->size(), 3);
+
+    DataTypeSerDe::FormatOptions options;
+    for (size_t i = 0; i < column->size(); ++i) {
+        auto serialized_column = ColumnString::create();
+        VectorBufferWriter buffer_writer(*serialized_column);
+        st = serde_jsonb->serialize_one_cell_to_json(*column, i, buffer_writer, options);
+        ASSERT_TRUE(st.ok());
+        buffer_writer.commit();
+        EXPECT_EQ(serialized_column->get_data_at(0).to_string(), values[i + 1]);
+    }
+}
+
+TEST(DataTypeJsonbNestedSerDeTest, JsonValuesKeepTheirOwnQuotesAtEveryNestingLevel) {
+    const std::array<std::string, 6> values {R"({"a":1})", R"("x\"y")", "null",
+                                             "[]",         "123.125",   "true"};
+    DataTypeSerDe::FormatOptions options;
+    for (int level : {1, 2, 3}) {
+        DataTypeJsonbSerDe serde(level);
+        for (const auto& text : values) {
+            auto column = ColumnString::create();
+            Slice slice(text.data(), text.size());
+            const auto status = serde.deserialize_one_cell_from_json(*column, slice, options);
+            ASSERT_TRUE(status.ok()) << status;
+            auto output = ColumnString::create();
+            BufferWritable writer(*output);
+            serde.to_string(*column, 0, writer, options);
+            writer.commit();
+            EXPECT_EQ(output->get_data_at(0).to_string(), text) << "nesting level " << level;
+        }
+    }
+}
+
+TEST(DataTypeJsonbNestedSerDeTest, TypedComplexRoundTripPreservesJsonAndSqlNull) {
+    auto json = make_nullable(std::make_shared<DataTypeJsonb>());
+    auto string = make_nullable(std::make_shared<DataTypeString>());
+    const std::array<DataTypePtr, 3> types {
+            std::make_shared<DataTypeArray>(json), std::make_shared<DataTypeMap>(string, json),
+            std::make_shared<DataTypeStruct>(DataTypes {json}, Strings {"payload"})};
+    const std::array<std::string, 11> values {R"({"a":[1,"two"]})",
+                                              R"("text")",
+                                              R"("123")",
+                                              R"("null")",
+                                              R"("true")",
+                                              R"("x\"y\\z")",
+                                              "null",
+                                              "NULL",
+                                              "[]",
+                                              "123.125",
+                                              "true"};
+    DataTypeSerDe::FormatOptions options;
+    for (size_t i = 0; i < types.size(); ++i) {
+        const auto serde = types[i]->get_serde();
+        for (const auto& value : values) {
+            const auto text = i == 0   ? "[" + value + "]"
+                              : i == 1 ? "{\"key\":" + value + "}"
+                                       : "{\"payload\":" + value + "}";
+            for (bool strict : {false, true}) {
+                auto column = types[i]->create_column();
+                StringRef input(text);
+                const auto status = strict ? serde->from_string_strict_mode(input, *column, options)
+                                           : serde->from_string(input, *column, options);
+                ASSERT_TRUE(status.ok()) << status << ": " << text << ", strict=" << strict;
+                auto output = ColumnString::create();
+                BufferWritable writer(*output);
+                serde->to_string(*column, 0, writer, options);
+                writer.commit();
+                EXPECT_EQ(output->get_data_at(0).to_string(), text)
+                        << types[i]->get_name() << ", strict=" << strict;
+            }
+        }
+    }
+}
+
+TEST(DataTypeJsonbNestedSerDeTest, MultipleNestingLevelsPreserveChildNullMarkers) {
+    auto json = make_nullable(std::make_shared<DataTypeJsonb>());
+    auto string = make_nullable(std::make_shared<DataTypeString>());
+    auto array = make_nullable(std::make_shared<DataTypeArray>(json));
+    const std::array<DataTypePtr, 3> types {
+            std::make_shared<DataTypeArray>(array), std::make_shared<DataTypeMap>(string, array),
+            std::make_shared<DataTypeStruct>(DataTypes {array, string},
+                                             Strings {"payload", "label"})};
+    const std::string payload =
+            R"(["123", "null", "true", null, NULL, {"a":[1,"two"]}, [], 123.125, true, "x\"y\\z"])";
+    const std::array<std::string, 3> texts {
+            "[" + payload + ", null, []]",
+            "{\"key\":" + payload + ", \"missing\":null, \"empty\":[]}",
+            "{\"payload\":" + payload + ", \"label\":\"null\"}"};
+    DataTypeSerDe::FormatOptions options;
+    for (size_t i = 0; i < types.size(); ++i) {
+        const auto serde = types[i]->get_serde();
+        for (bool strict : {false, true}) {
+            auto column = types[i]->create_column();
+            StringRef input(texts[i]);
+            const auto status = strict ? serde->from_string_strict_mode(input, *column, options)
+                                       : serde->from_string(input, *column, options);
+            ASSERT_TRUE(status.ok()) << status << ", strict=" << strict;
+            auto output = ColumnString::create();
+            BufferWritable writer(*output);
+            serde->to_string(*column, 0, writer, options);
+            writer.commit();
+            EXPECT_EQ(output->get_data_at(0).to_string(), texts[i])
+                    << types[i]->get_name() << ", strict=" << strict;
+        }
+    }
+}
+
+TEST(DataTypeJsonbNestedSerDeTest, InvalidChildRespectsStrictMode) {
+    auto json = make_nullable(std::make_shared<DataTypeJsonb>());
+    auto string = make_nullable(std::make_shared<DataTypeString>());
+    const std::array<DataTypePtr, 3> types {
+            std::make_shared<DataTypeArray>(json), std::make_shared<DataTypeMap>(string, json),
+            std::make_shared<DataTypeStruct>(DataTypes {json}, Strings {"payload"})};
+    const std::array<std::string, 3> inputs {"[invalid]", "{\"key\":invalid}",
+                                             "{\"payload\":invalid}"};
+    const std::array<std::string, 3> outputs {"[NULL]", "{\"key\":NULL}", "{\"payload\":NULL}"};
+    DataTypeSerDe::FormatOptions options;
+    for (size_t i = 0; i < types.size(); ++i) {
+        const auto serde = types[i]->get_serde();
+        for (bool strict : {false, true}) {
+            auto column = types[i]->create_column();
+            StringRef input(inputs[i]);
+            const auto status = strict ? serde->from_string_strict_mode(input, *column, options)
+                                       : serde->from_string(input, *column, options);
+            ASSERT_EQ(status.ok(), !strict) << status << ": " << types[i]->get_name();
+            if (!strict) {
+                auto output = ColumnString::create();
+                BufferWritable writer(*output);
+                serde->to_string(*column, 0, writer, options);
+                writer.commit();
+                EXPECT_EQ(output->get_data_at(0).to_string(), outputs[i]) << types[i]->get_name();
+            }
+        }
+    }
+}
+
+TEST(DataTypeJsonbNestedSerDeTest, SingleQuotedChildrenPreserveJsonSyntax) {
+    auto json = make_nullable(std::make_shared<DataTypeJsonb>());
+    auto string = make_nullable(std::make_shared<DataTypeString>());
+    const std::array<DataTypePtr, 3> types {
+            std::make_shared<DataTypeArray>(json), std::make_shared<DataTypeMap>(string, json),
+            std::make_shared<DataTypeStruct>(DataTypes {json}, Strings {"payload"})};
+    const std::array<std::string, 8> values {
+            R"({"a":[1,"two"]})", R"("123")", R"("null")", R"("true")",
+            R"("x\"y\\z")",       "null",     "123.125",   "true"};
+    DataTypeSerDe::FormatOptions options;
+    for (size_t i = 0; i < types.size(); ++i) {
+        const auto serde = types[i]->get_serde();
+        const std::string prefix = i == 0 ? "[" : i == 1 ? "{\"key\":" : "{\"payload\":";
+        const std::string suffix = i == 0 ? "]" : "}";
+        for (const auto& value : values) {
+            const auto text = prefix + "'" + value + "'" + suffix;
+            for (bool strict : {false, true}) {
+                auto column = types[i]->create_column();
+                StringRef input(text);
+                const auto status = strict ? serde->from_string_strict_mode(input, *column, options)
+                                           : serde->from_string(input, *column, options);
+                ASSERT_TRUE(status.ok()) << status << ": " << text << ", strict=" << strict;
+                auto output = ColumnString::create();
+                BufferWritable writer(*output);
+                serde->to_string(*column, 0, writer, options);
+                writer.commit();
+                EXPECT_EQ(output->get_data_at(0).to_string(), prefix + value + suffix)
+                        << types[i]->get_name() << ", strict=" << strict;
+            }
+        }
+    }
 }
 
 } // namespace doris

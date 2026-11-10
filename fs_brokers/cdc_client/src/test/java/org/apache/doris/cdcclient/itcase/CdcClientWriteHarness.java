@@ -19,11 +19,14 @@ package org.apache.doris.cdcclient.itcase;
 
 import org.apache.doris.cdcclient.common.Env;
 import org.apache.doris.cdcclient.service.PipelineCoordinator;
+import org.apache.doris.cdcclient.source.reader.AbstractCdcSourceReader;
 import org.apache.doris.cdcclient.source.reader.SourceReader;
 import org.apache.doris.job.cdc.DataSourceConfigKeys;
+import org.apache.doris.job.cdc.request.FetchEndOffsetRequest;
 import org.apache.doris.job.cdc.request.FetchTableSplitsRequest;
 import org.apache.doris.job.cdc.request.JobBaseConfig;
 import org.apache.doris.job.cdc.request.WriteRecordRequest;
+import org.apache.doris.job.cdc.response.FetchEndOffsetResult;
 import org.apache.doris.job.cdc.split.AbstractSourceSplit;
 import org.apache.doris.job.cdc.split.BinlogSplit;
 import org.apache.doris.job.cdc.split.SnapshotSplit;
@@ -32,12 +35,17 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
+
+import io.debezium.relational.Table;
+import io.debezium.relational.TableId;
+import io.debezium.relational.history.TableChanges;
 
 /**
  * Test driver for the from-to {@code writeRecords} path: drives the read + deserialize + streamload
@@ -62,6 +70,8 @@ final class CdcClientWriteHarness implements AutoCloseable {
     // Threaded across rounds, mirroring how FE persists and replays them.
     private String lastTableSchemas;
     private Map<String, String> lastBinlogOffset;
+    private boolean rebuildReaderOnNextWrite;
+    private boolean tolerateSchemaChange;
 
     private CdcClientWriteHarness(
             String jobId,
@@ -87,6 +97,57 @@ final class CdcClientWriteHarness implements AutoCloseable {
             String offset,
             String targetDb,
             MockDorisServer mock) {
+        return mysqlCompatible(
+                jobId,
+                "MYSQL",
+                host,
+                port,
+                user,
+                password,
+                database,
+                includeTables,
+                offset,
+                targetDb,
+                mock);
+    }
+
+    static CdcClientWriteHarness oceanbase(
+            String jobId,
+            String host,
+            int port,
+            String user,
+            String password,
+            String database,
+            String includeTables,
+            String offset,
+            String targetDb,
+            MockDorisServer mock) {
+        return mysqlCompatible(
+                jobId,
+                "OCEANBASE",
+                host,
+                port,
+                user,
+                password,
+                database,
+                includeTables,
+                offset,
+                targetDb,
+                mock);
+    }
+
+    private static CdcClientWriteHarness mysqlCompatible(
+            String jobId,
+            String dataSource,
+            String host,
+            int port,
+            String user,
+            String password,
+            String database,
+            String includeTables,
+            String offset,
+            String targetDb,
+            MockDorisServer mock) {
         Map<String, String> config = new HashMap<>();
         config.put(
                 DataSourceConfigKeys.JDBC_URL,
@@ -101,7 +162,7 @@ final class CdcClientWriteHarness implements AutoCloseable {
         // Point cdc_client's stream-load at the mock BE.
         Env.getCurrentEnv().setBackendHttpPort(mock.port());
         Env.getCurrentEnv().setClusterToken("test");
-        return new CdcClientWriteHarness(jobId, "MYSQL", config, targetDb, mock);
+        return new CdcClientWriteHarness(jobId, dataSource, config, targetDb, mock);
     }
 
     static CdcClientWriteHarness postgres(
@@ -159,9 +220,19 @@ final class CdcClientWriteHarness implements AutoCloseable {
         return new JobBaseConfig(jobId, dataSource, config, null);
     }
 
+    /**
+     * Open the job's reader the way FE's CREATE JOB does via {@code /api/initReader}:
+     * createResources=true so the PG slot/publication are pre-created on first open. Idempotent —
+     * later opens reuse the cached reader. Must run before any coordinator write, whose numeric jobId
+     * would otherwise open the reader with createResources=false and never provision them.
+     */
+    private SourceReader openReader() {
+        return Env.getCurrentEnv().getReader(baseConfig(), true);
+    }
+
     /** Compute every snapshot chunk for one table (mirrors FE's /api/fetchSplits cursor). */
     List<SnapshotSplit> fetchAllSnapshotSplits(String table) {
-        SourceReader reader = Env.getCurrentEnv().getReader(baseConfig());
+        SourceReader reader = openReader();
         List<SnapshotSplit> all = new ArrayList<>();
         Object[] nextSplitStart = null;
         Integer nextSplitId = null;
@@ -209,6 +280,39 @@ final class CdcClientWriteHarness implements AutoCloseable {
      */
     void enterBinlog(List<SnapshotSplit> splits) throws Exception {
         runWrite(finishedSplitsMeta(splits, committedSnapshotOffsets()));
+    }
+
+    /** Inject an invalid entry after the request baseline has been loaded. */
+    void injectUnserializableTableSchema() {
+        AbstractCdcSourceReader reader = (AbstractCdcSourceReader) openReader();
+        TableId tableId = new TableId(null, "public", "invalid_serialization_schema");
+        Table invalidTable =
+                (Table)
+                        Proxy.newProxyInstance(
+                                Table.class.getClassLoader(),
+                                new Class<?>[] {Table.class},
+                                (proxy, method, args) -> {
+                                    if ("id".equals(method.getName())) {
+                                        return tableId;
+                                    }
+                                    throw new IllegalStateException("injected schema serialization failure");
+                                });
+        reader.getTableSchemas()
+                .put(
+                        tableId,
+                        new TableChanges.TableChange(
+                                TableChanges.TableChangeType.ALTER, invalidTable));
+    }
+
+    /** Rebuild the cached reader on the next write while resuming from FE-persisted state. */
+    void rebuildReaderOnNextWrite() {
+        rebuildReaderOnNextWrite = true;
+    }
+
+    /** Mirror manual RESUME after an unsupported-schema failure. */
+    void acceptUnsupportedSchemaChanges() {
+        tolerateSchemaChange = true;
+        rebuildReaderOnNextWrite = true;
     }
 
     /**
@@ -263,8 +367,10 @@ final class CdcClientWriteHarness implements AutoCloseable {
     }
 
     private void runWrite(Map<String, Object> meta) throws Exception {
+        openReader();
         coordinator.writeRecords(buildRequest(meta));
         capture();
+        tolerateSchemaChange = false;
     }
 
     /** Capture tableSchemas and the binlog offset from the last commit, to replay next round. */
@@ -351,8 +457,14 @@ final class CdcClientWriteHarness implements AutoCloseable {
         req.setTaskId(String.valueOf(taskSeq.incrementAndGet()));
         req.setTargetDb(targetDb);
         req.setToken("test-token");
+        req.setDorisUser("cdc_job_user");
         req.setMaxInterval(3);
         req.setTaskTimeoutMs(60_000);
+        req.setRebuildReader(rebuildReaderOnNextWrite);
+        req.setTolerateSchemaChange(tolerateSchemaChange);
+        req.setReuseReader(
+                BinlogSplit.BINLOG_SPLIT_ID.equals(String.valueOf(meta.get("splitId"))));
+        rebuildReaderOnNextWrite = false;
         req.setStreamLoadProps(new HashMap<>());
         return req;
     }
@@ -369,8 +481,25 @@ final class CdcClientWriteHarness implements AutoCloseable {
         return mock.committedOffset();
     }
 
+    String committedTableSchemas() {
+        return lastTableSchemas;
+    }
+
+    long sourceLogLagBytes() throws Exception {
+        Map<String, String> referenceOffset = committedBinlogOffset();
+        FetchEndOffsetRequest request =
+                new FetchEndOffsetRequest(jobId, dataSource, config, null, referenceOffset);
+        SourceReader reader = openReader();
+        FetchEndOffsetResult result = reader.fetchEndOffset(request);
+        return result.getLagBytes();
+    }
+
     @Override
     public void close() {
+        SourceReader reader = Env.getCurrentEnv().getReaderIfPresent(jobId);
+        if (reader != null) {
+            reader.close(baseConfig());
+        }
         Env.getCurrentEnv().close(jobId);
     }
 

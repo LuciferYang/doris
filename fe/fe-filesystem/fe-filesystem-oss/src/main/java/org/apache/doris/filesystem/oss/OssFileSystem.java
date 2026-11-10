@@ -17,6 +17,7 @@
 
 package org.apache.doris.filesystem.oss;
 
+import org.apache.doris.filesystem.spi.ObjectStorageUri;
 import org.apache.doris.filesystem.spi.S3CompatibleFileSystem;
 
 /**
@@ -25,6 +26,11 @@ import org.apache.doris.filesystem.spi.S3CompatibleFileSystem;
 public class OssFileSystem extends S3CompatibleFileSystem {
 
     public OssFileSystem(OssObjStorage objStorage) {
-        super(objStorage, objStorage.isUsePathStyle());
+        super(objStorage, objStorage.isUsePathStyle(), objStorage.getSupportedSchemes());
+    }
+
+    @Override
+    protected ObjectStorageUri parseUri(String uri) {
+        return ((OssObjStorage) objStorage).parseUri(uri);
     }
 }

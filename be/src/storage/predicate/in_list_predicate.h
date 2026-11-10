@@ -36,10 +36,11 @@
 #include "core/uint24.h"
 #include "exprs/hybrid_set.h"
 #include "storage/index/bloom_filter/bloom_filter.h"
-#include "storage/index/inverted/inverted_index_cache.h" // IWYU pragma: keep
+#include "storage/index/inverted/common/inverted_index_cache.h" // IWYU pragma: keep
 #include "storage/index/inverted/inverted_index_reader.h"
 #include "storage/olap_common.h"
 #include "storage/predicate/column_predicate.h"
+#include "storage/storage_layout.h"
 
 // for uint24_t
 template <>
@@ -58,6 +59,7 @@ struct std::equal_to<doris::uint24_t> {
 };
 
 namespace doris {
+
 /**
  * Use HybridSetType can avoid virtual function call in the loop.
  * @tparam Type
@@ -77,7 +79,7 @@ public:
         CHECK(hybrid_set != nullptr);
 
         // String types need a copy because:
-        // The caller's set is StringSet<DynamicContainer<std::string>>, but here we want
+        // The caller's set is an owning dynamic StringSet, but here we want
         // StringSet<FixedContainer<std::string, N>> for small-set optimization — different
         // C++ types, cannot share the pointer.
         //
@@ -357,34 +359,12 @@ public:
                     if (bf->test_bytes(value->data, value->size)) {
                         return true;
                     }
-                } else if constexpr (Type == PrimitiveType::TYPE_DECIMALV2) {
-                    // DecimalV2 using decimal12_t in bloom filter in storage layer,
-                    // should convert value to decimal12_t
-                    // Datev1/DatetimeV1 using VecDatetimeValue in bloom filter, NO need to convert.
-                    const T* value = (const T*)(iter->get_value());
-                    decimal12_t decimal12_t_val(value->int_value(), value->frac_value());
-                    if (bf->test_bytes(reinterpret_cast<const char*>(&decimal12_t_val),
-                                       sizeof(decimal12_t))) {
-                        return true;
-                    }
-                } else if constexpr (Type == PrimitiveType::TYPE_DATE) {
-                    const T* value = (const T*)(iter->get_value());
-                    uint24_t date_value(uint32_t(value->to_olap_date()));
-                    if (bf->test_bytes(reinterpret_cast<const char*>(&date_value),
-                                       sizeof(uint24_t))) {
-                        return true;
-                    }
-                    // DatetimeV1 using int64_t in bloom filter
-                } else if constexpr (Type == PrimitiveType::TYPE_DATETIME) {
-                    const T* value = (const T*)(iter->get_value());
-                    int64_t datetime_value(value->to_olap_datetime());
-                    if (bf->test_bytes(reinterpret_cast<const char*>(&datetime_value),
-                                       sizeof(int64_t))) {
-                        return true;
-                    }
                 } else {
                     const T* value = (const T*)(iter->get_value());
-                    if (bf->test_bytes(reinterpret_cast<const char*>(value), sizeof(*value))) {
+                    const auto stored =
+                            StorageLayout<primitive_type_to_storage_field_type(Type)>::to_storage(
+                                    *value);
+                    if (bf->test_bytes(reinterpret_cast<const char*>(&stored), sizeof(stored))) {
                         return true;
                     }
                 }
@@ -536,15 +516,16 @@ private:
                 __builtin_unreachable();
             }
         } else {
-            // ptr_at safe: HybridSet::find consumes the pointer synchronously.
             ColumnElementView<Type> pred_col {*column};
-#define EVALUATE_WITH_NULL_IMPL(IDX) \
-    is_opposite ^ (!(*null_map)[IDX] && _operator(_values->find(pred_col.ptr_at(IDX)), false))
-#define EVALUATE_WITHOUT_NULL_IMPL(IDX) \
-    is_opposite ^ _operator(_values->find(pred_col.ptr_at(IDX)), false)
-            EVALUATE_BY_SELECTOR(EVALUATE_WITH_NULL_IMPL, EVALUATE_WITHOUT_NULL_IMPL)
-#undef EVALUATE_WITH_NULL_IMPL
-#undef EVALUATE_WITHOUT_NULL_IMPL
+            auto with_null = [&](uint16_t idx) {
+                return is_opposite ^
+                       (!(*null_map)[idx] && _operator(_find_value(pred_col, idx), false));
+            };
+            auto without_null = [&](uint16_t idx) {
+                return is_opposite ^ _operator(_find_value(pred_col, idx), false);
+            };
+            evaluate_by_selector<is_nullable>(pred_col, size, sel, new_size, with_null,
+                                              without_null);
         }
         return new_size;
     }
@@ -592,7 +573,6 @@ private:
                 __builtin_unreachable();
             }
         } else {
-            // ptr_at safe: HybridSet::find consumes the pointer synchronously.
             ColumnElementView<Type> view {*column};
             for (uint16_t i = 0; i < size; i++) {
                 if (is_and ^ flags[i]) {
@@ -607,7 +587,7 @@ private:
                         continue;
                     }
                 }
-                bool hit = _operator(_values->find(view.ptr_at(idx)), false);
+                bool hit = _operator(_find_value(view, idx), false);
                 if constexpr (!is_opposite) {
                     if (is_and ^ hit) {
                         flags[i] = !is_and;
@@ -627,6 +607,15 @@ private:
         }
         if (Compare::less(value, _min_value)) {
             _min_value = value;
+        }
+    }
+
+    ALWAYS_INLINE bool _find_value(const ColumnElementView<Type>& pred_col, size_t idx) const {
+        if constexpr (is_string_type(Type)) {
+            const auto value = pred_col.get_element(idx);
+            return _values->find(value.data, value.size);
+        } else {
+            return _values->find(pred_col.get_data() + idx, sizeof(T));
         }
     }
 

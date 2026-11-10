@@ -35,6 +35,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -55,10 +56,13 @@ public abstract class S3CompatibleFileSystem extends ObjFileSystem {
     private static final String DIR_MARKER_SUFFIX = "/";
 
     private final boolean usePathStyle;
+    private final Set<String> supportedSchemes;
 
-    protected S3CompatibleFileSystem(ObjStorage<?> objStorage, boolean usePathStyle) {
+    protected S3CompatibleFileSystem(ObjStorage<?> objStorage, boolean usePathStyle,
+            Set<String> supportedSchemes) {
         super(objStorage);
         this.usePathStyle = usePathStyle;
+        this.supportedSchemes = supportedSchemes;
     }
 
     @Override
@@ -202,9 +206,13 @@ public abstract class S3CompatibleFileSystem extends ObjFileSystem {
         } while (continuationToken != null);
     }
 
-    /** Parses {@code uri} respecting the underlying client's path-style configuration. */
-    private ObjectStorageUri parseUri(String uri) {
-        return ObjectStorageUri.parse(uri, usePathStyle);
+    /**
+     * Parses {@code uri} respecting the underlying client's path-style configuration.
+     * Providers must apply the same bucket parsing here and in object requests, since batch
+     * deletion extracts bucket names here before calling the native client.
+     */
+    protected ObjectStorageUri parseUri(String uri) {
+        return ObjectStorageUri.parse(uri, usePathStyle, supportedSchemes);
     }
 
     /**
@@ -544,6 +552,13 @@ public abstract class S3CompatibleFileSystem extends ObjFileSystem {
         private List<FileEntry> buffer = new ArrayList<>();
         private int bufferIdx = 0;
         private boolean done = false;
+        private Runnable cancellationCheck = () -> { };
+
+        @Override
+        public FileIterator withCancellationCheck(Runnable check) {
+            cancellationCheck = check;
+            return this;
+        }
 
         ObjectStorageFileIterator(String prefix) {
             this.prefix = prefix;
@@ -551,17 +566,17 @@ public abstract class S3CompatibleFileSystem extends ObjFileSystem {
 
         @Override
         public boolean hasNext() throws IOException {
-            if (bufferIdx < buffer.size()) {
-                return true;
+            cancellationCheck.run();
+            // A truncated page may consist entirely of directory markers and filter down to an
+            // empty buffer; keep paging until a visible entry shows up or the listing is exhausted.
+            while (bufferIdx >= buffer.size() && !done) {
+                fetchNextPage();
             }
-            if (done) {
-                return false;
-            }
-            fetchNextPage();
             return bufferIdx < buffer.size();
         }
 
         private void fetchNextPage() throws IOException {
+            cancellationCheck.run();
             RemoteObjects page = objStorage.listObjects(prefix, continuationToken);
             buffer = new ArrayList<>();
             bufferIdx = 0;
@@ -837,74 +852,24 @@ public abstract class S3CompatibleFileSystem extends ObjFileSystem {
      * ({@code * ? [ { \}).  Used as the {@code prefix} parameter for object storage {@code ListObjectsV2}.
      */
     protected static String longestNonGlobPrefix(String globPattern) {
-        int earliest = globPattern.length();
-        for (char c : new char[]{'*', '?', '[', '{', '\\'}) {
-            int idx = globPattern.indexOf(c);
-            if (idx >= 0 && idx < earliest) {
-                earliest = idx;
-            }
-        }
-        return globPattern.substring(0, earliest);
+        return ObjectStorageGlob.longestNonGlobPrefix(globPattern);
     }
 
-    /**
-     * Expands {@code {N..M}} numeric range syntax in a glob pattern to the equivalent
-     * comma-separated alternation {@code {N,N+1,...,M}} that Java's PathMatcher understands.
-     * Supports simple non-negative ranges like {@code {1..3}}, reverse ranges like {@code {3..1}},
-     * and mixed comma-separated patterns like {@code {1..2,3,1..3}} or {@code {Refrain,1..3}}.
-     * For simple (no-comma) brace groups, only non-negative ranges are expanded;
-     * negative-start ranges like {@code {-1..1}} are left unchanged.
-     * Duplicate values are removed. For example:
-     * <ul>
-     *   <li>{@code data_{1..3}.csv} → {@code data_{1,2,3}.csv}</li>
-     *   <li>{@code data_{1..2,3,1..3}.csv} → {@code data_{1,2,3}.csv}</li>
-     *   <li>{@code data_{Refrain,1..3}.csv} → {@code data_{Refrain,1,2,3}.csv}</li>
-     *   <li>{@code data_{-1..1}.csv} → unchanged (no expansion)</li>
-     * </ul>
-     */
-    private static String expandNumericRanges(String pattern) {
-        java.util.regex.Pattern rangeSegment = java.util.regex.Pattern.compile(
-                "(-?\\d+)\\.\\.(-?\\d+)");
-        java.util.regex.Pattern simpleRange = java.util.regex.Pattern.compile(
-                "\\{(\\d+)\\.\\.(\\d+)\\}");
-        // Match any brace group that contains at least one N..M range
-        java.util.regex.Pattern braceGroup = java.util.regex.Pattern.compile(
-                "\\{([^}]*\\d+\\.\\.\\d+[^}]*)\\}");
-        java.util.regex.Matcher m = braceGroup.matcher(pattern);
-        StringBuffer sb = new StringBuffer();
-        while (m.find()) {
-            String content = m.group(1);
-            boolean isMixed = content.contains(",");
-            if (!isMixed) {
-                // Simple brace group (no comma): only expand non-negative ranges
-                java.util.regex.Matcher sm = simpleRange.matcher(m.group(0));
-                if (!sm.matches()) {
-                    // Not a simple non-negative range (e.g., {-1..1}) — leave unchanged
-                    continue;
-                }
-            }
-            String[] segments = content.split(",", -1);
-            java.util.LinkedHashSet<String> values = new java.util.LinkedHashSet<>();
-            for (String seg : segments) {
-                java.util.regex.Matcher rm = rangeSegment.matcher(seg.trim());
-                if (rm.matches()) {
-                    int from = Integer.parseInt(rm.group(1));
-                    int to = Integer.parseInt(rm.group(2));
-                    int step = from <= to ? 1 : -1;
-                    for (int i = from; step > 0 ? i <= to : i >= to; i += step) {
-                        values.add(String.valueOf(i));
-                    }
-                } else {
-                    values.add(seg.trim());
-                }
-            }
-            StringBuilder expansion = new StringBuilder("{");
-            expansion.append(String.join(",", values));
-            expansion.append('}');
-            m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(expansion.toString()));
-        }
-        m.appendTail(sb);
-        return sb.toString();
+    protected static List<String> expandedGlobListPrefixes(String globPattern) {
+        return ObjectStorageGlob.expandedGlobListPrefixes(globPattern);
+    }
+
+    protected String globListPrefix(String globPattern) {
+        return longestNonGlobPrefix(globPattern);
+    }
+
+    protected List<String> globListPrefixes(String globPattern, String listPrefix) {
+        return expandedGlobListPrefixes(globPattern);
+    }
+
+    /** Compiles the same numeric-range and glob syntax used by LIST for matching raw object keys. */
+    public static Pattern compileGlobPattern(String keyPattern) {
+        return Pattern.compile(globToRegex(ObjectStorageGlob.expandNumericRanges(keyPattern)));
     }
 
     @Override
@@ -917,13 +882,14 @@ public abstract class S3CompatibleFileSystem extends ObjFileSystem {
         String keyPattern = parsed.key();
         String base = uriBase(uri, parsed);
 
-        String expandedKeyPattern = expandNumericRanges(keyPattern);
+        String expandedKeyPattern = ObjectStorageGlob.expandNumericRanges(keyPattern);
         // Translate the glob to a regex and match against the raw object storage key. We do NOT
         // route through java.nio.file.Paths because (a) on Windows the filesystem
         // separator is '\' which would corrupt object storage keys, and (b) Paths.get rejects keys
         // containing characters illegal in the host OS path syntax (':', '\', etc.).
         Pattern matcher = Pattern.compile(globToRegex(expandedKeyPattern));
-        String listPrefix = longestNonGlobPrefix(expandedKeyPattern);
+        String listPrefix = globListPrefix(expandedKeyPattern);
+        List<String> listPrefixes = globListPrefixes(expandedKeyPattern, listPrefix);
 
         List<FileEntry> files = new ArrayList<>();
         long totalSize = 0L;
@@ -933,51 +899,56 @@ public abstract class S3CompatibleFileSystem extends ObjFileSystem {
         String nextMatchAfterLimit = "";
         String lastMatchedKey = "";
         boolean isTruncated;
-        String continuationToken = null;
-        String listUri = base + listPrefix;
 
         try {
-            do {
-                RemoteObjects response = objStorage.listObjectsWithOptions(listUri, ObjectListOptions.builder()
-                        .continuationToken(continuationToken)
-                        .startAfter(continuationToken == null ? startAfter : null)
-                        .build());
-                for (RemoteObject obj : response.getObjectList()) {
-                    if (reachLimit) {
-                        // After hitting limit: find the first matching key so callers know more data exists.
-                        if (nextMatchAfterLimit.isEmpty()
-                                && matcher.matcher(obj.getKey()).matches()) {
-                            nextMatchAfterLimit = obj.getKey();
+            for (String currentListPrefix : listPrefixes) {
+                String continuationToken = null;
+                String listUri = base + currentListPrefix;
+                do {
+                    RemoteObjects response = objStorage.listObjectsWithOptions(listUri, ObjectListOptions.builder()
+                            .continuationToken(continuationToken)
+                            .startAfter(continuationToken == null ? startAfter : null)
+                            .build());
+                    for (RemoteObject obj : response.getObjectList()) {
+                        if (reachLimit) {
+                            // After hitting limit: find the first matching key so callers know more data exists.
+                            if (nextMatchAfterLimit.isEmpty()
+                                    && matcher.matcher(obj.getKey()).matches()) {
+                                nextMatchAfterLimit = obj.getKey();
+                            }
+                            continue;
                         }
-                        continue;
+
+                        if (!matcher.matcher(obj.getKey()).matches()) {
+                            continue;
+                        }
+
+                        files.add(new FileEntry(
+                                Location.of(base + obj.getKey()),
+                                obj.getSize(),
+                                false,
+                                obj.getModificationTime(),
+                                null));
+                        totalSize += obj.getSize();
+                        lastMatchedKey = obj.getKey();
+
+                        if ((maxFiles > 0 && files.size() >= maxFiles)
+                                || (maxBytes > 0 && totalSize >= maxBytes)) {
+                            reachLimit = true;
+                        }
                     }
 
-                    if (!matcher.matcher(obj.getKey()).matches()) {
-                        continue;
+                    isTruncated = response.isTruncated();
+                    if (isTruncated) {
+                        continuationToken = response.getContinuationToken();
                     }
-
-                    files.add(new FileEntry(
-                            Location.of(base + obj.getKey()),
-                            obj.getSize(),
-                            false,
-                            obj.getModificationTime(),
-                            null));
-                    totalSize += obj.getSize();
-                    lastMatchedKey = obj.getKey();
-
-                    if ((maxFiles > 0 && files.size() >= maxFiles)
-                            || (maxBytes > 0 && totalSize >= maxBytes)) {
-                        reachLimit = true;
-                    }
+                    // Continue paginating after limit until we find the next matching key,
+                    // so callers can use it as a pagination cursor.
+                } while (isTruncated && (!reachLimit || nextMatchAfterLimit.isEmpty()));
+                if (reachLimit && !nextMatchAfterLimit.isEmpty()) {
+                    break;
                 }
-
-                isTruncated = response.isTruncated();
-                if (isTruncated) {
-                    continuationToken = response.getContinuationToken();
-                }
-                // Continue paginating after limit until we find the next matching key,
-                // so callers can use it as a pagination cursor.
-            } while (isTruncated && (!reachLimit || nextMatchAfterLimit.isEmpty()));
+            }
         } catch (Exception e) {
             throw new IOException("Failed to list object storage objects at " + uri + ": " + e.getMessage(), e);
         }
@@ -1005,86 +976,6 @@ public abstract class S3CompatibleFileSystem extends ObjFileSystem {
      * a single {@code *} does not cross directory levels.
      */
     protected static String globToRegex(String glob) {
-        StringBuilder sb = new StringBuilder("^");
-        boolean inClass = false;
-        boolean inGroup = false;
-        int i = 0;
-        while (i < glob.length()) {
-            char c = glob.charAt(i);
-            if (c == '\\') {
-                if (i + 1 < glob.length()) {
-                    sb.append(Pattern.quote(String.valueOf(glob.charAt(i + 1))));
-                    i += 2;
-                } else {
-                    sb.append("\\\\");
-                    i++;
-                }
-                continue;
-            }
-            if (inClass) {
-                if (c == ']') {
-                    inClass = false;
-                    sb.append(']');
-                } else if (c == '\\' || c == '[') {
-                    sb.append('\\').append(c);
-                } else {
-                    sb.append(c);
-                }
-                i++;
-                continue;
-            }
-            switch (c) {
-                case '*':
-                    if (i + 1 < glob.length() && glob.charAt(i + 1) == '*') {
-                        sb.append(".*");
-                        i += 2;
-                    } else {
-                        sb.append("[^/]*");
-                        i++;
-                    }
-                    break;
-                case '?':
-                    sb.append("[^/]");
-                    i++;
-                    break;
-                case '[':
-                    inClass = true;
-                    sb.append('[');
-                    i++;
-                    if (i < glob.length() && glob.charAt(i) == '!') {
-                        sb.append('^');
-                        i++;
-                    }
-                    break;
-                case '{':
-                    inGroup = true;
-                    sb.append("(?:");
-                    i++;
-                    break;
-                case '}':
-                    inGroup = false;
-                    sb.append(')');
-                    i++;
-                    break;
-                case ',':
-                    if (inGroup) {
-                        sb.append('|');
-                    } else {
-                        sb.append(',');
-                    }
-                    i++;
-                    break;
-                default:
-                    if ("\\.^$|+()".indexOf(c) >= 0) {
-                        sb.append('\\').append(c);
-                    } else {
-                        sb.append(c);
-                    }
-                    i++;
-                    break;
-            }
-        }
-        sb.append('$');
-        return sb.toString();
+        return ObjectStorageGlob.globToRegex(glob);
     }
 }

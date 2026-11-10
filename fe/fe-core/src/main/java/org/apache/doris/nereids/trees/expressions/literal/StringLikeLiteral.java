@@ -21,14 +21,13 @@ import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.exceptions.CastException;
 import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.functions.executable.DateTimeExtractAndTransform;
 import org.apache.doris.nereids.trees.expressions.literal.format.DateTimeChecker;
 import org.apache.doris.nereids.types.DataType;
-import org.apache.doris.nereids.types.DateTimeType;
 import org.apache.doris.nereids.types.DateTimeV2Type;
+import org.apache.doris.nereids.types.FloatType;
+import org.apache.doris.nereids.types.TimeStampNsType;
 import org.apache.doris.nereids.types.TimeStampTzType;
 import org.apache.doris.nereids.types.TimeV2Type;
-import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
 
 import com.google.common.base.Preconditions;
@@ -70,9 +69,11 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
             + "(?:\\s*(?<tz>[+-]\\d{1,2}(?::?(?:00|30|45))?"
             + "|(?i)([A-Za-z]+\\S*)))?"
             + ")?\\s*$";
+    // Same grammar as BE StringParser::string_to_float: only ASCII whitespace around the number is
+    // skipped, and fast_float also accepts a NaN payload such as nan(ind).
     public static final String toDoubleRegex
-            = "^\\s*[+-]?(?:(?:[0-9]+|[0-9]+\\.[0-9]*|[0-9]*\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|(?"
-            + "i)(?:INF|INFINITY)|(?i)NAN)\\s*$";
+            = "^\\s*(?<number>[+-]?(?:(?:[0-9]+|[0-9]+\\.[0-9]*|[0-9]*\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|(?"
+            + "i)(?:INF|INFINITY)|(?i)NAN(?:\\([0-9A-Za-z_]*\\))?))\\s*$";
     public static final String toDecimalRegex
             = "^\\s*[+-]?((\\d+\\.\\d+)|(\\d+)|(\\d+\\.)|(\\.\\d+))(?:([eE])[+-]?\\d+)?\\s*$";
     public static final String toIntStrict = "\\s*[+-]?\\d+\\s*";
@@ -135,21 +136,11 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
             return castToIntegral(targetType, strictCast);
         }
         if (targetType.isDateType() || targetType.isDateV2Type()) {
-            Expression expression = castToDateTime(DateTimeV2Type.MAX, strictCast, false);
-            DateTimeV2Literal datetime = (DateTimeV2Literal) expression;
-            if (targetType.isDateType()) {
-                return new DateLiteral(datetime.year, datetime.month, datetime.day);
-            } else {
-                return new DateV2Literal(datetime.year, datetime.month, datetime.day);
-            }
+            return castToDateTime(targetType, strictCast);
         } else if (targetType.isDateTimeType()) {
-            Expression expression = castToDateTime(DateTimeV2Type.MAX, strictCast, true);
-            DateTimeV2Literal datetime = (DateTimeV2Literal) expression;
-            return new DateTimeLiteral((DateTimeType) targetType, datetime.year, datetime.month, datetime.day,
-                    datetime.hour, datetime.minute, datetime.second, datetime.microSecond);
+            return castToDateTime(targetType, strictCast);
         } else if (targetType.isTimeStampTzType()) {
-            // Explicit offsets must not round-trip through session local time; that loses the selected
-            // branch in DST fold hours. Wildcard targets still need a concrete scale before parsing.
+            // Wildcard targets still need a concrete scale before parsing.
             TimeStampTzType timeStampTzType = (TimeStampTzType) targetType;
             if (timeStampTzType.getScale() < 0) {
                 timeStampTzType = TimeStampTzType.forTypeFromString(value);
@@ -157,13 +148,11 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
             if (DateTimeChecker.hasTimeZone(value)) {
                 return new TimestampTzLiteral(timeStampTzType, value);
             }
-            DateTimeV2Literal expression = castToDateTime(DateTimeV2Type.MAX, strictCast, true);
-            expression = (DateTimeV2Literal) (DateTimeExtractAndTransform.convertTz(expression,
-                    new StringLiteral(ConnectContext.get().getSessionVariable().timeZone), new StringLiteral("UTC")));
-            return new TimestampTzLiteral(timeStampTzType, expression.year, expression.month,
-                    expression.day, expression.hour, expression.minute, expression.second, expression.microSecond);
-        } else if (targetType.isDateTimeV2Type()) {
-            return castToDateTime(targetType, strictCast, true);
+            DateTimeV2Literal datetime = (DateTimeV2Literal) castToDateTime(
+                    DateTimeV2Type.MAX, strictCast);
+            return TimestampTzLiteral.fromSessionTimeZone(timeStampTzType, datetime);
+        } else if (targetType.isTimeStampNsType() || targetType.isDateTimeV2Type()) {
+            return castToDateTime(targetType, strictCast);
         } else if (targetType.isFloatType()) {
             return castToFloat();
         } else if (targetType.isDoubleType()) {
@@ -178,6 +167,8 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
             return new IPv4Literal(value);
         } else if (targetType.isIPv6Type()) {
             return new IPv6Literal(value);
+        } else if (targetType.isUuidType()) {
+            return new UuidLiteral(value);
         } else if (targetType.isTimeType()) {
             if (this.dataType.isStringLikeType()) { // could parse in FE
                 return new TimeV2Literal((TimeV2Type) targetType, value);
@@ -212,37 +203,37 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
     }
 
     protected Expression castToFloat() {
-        String trimmedValue = value.trim();
-        if (doublePattern.matcher(trimmedValue).matches()) {
-            if (DoubleLiteral.POS_INF_NAME.contains(trimmedValue.toLowerCase())) {
-                return Literal.of(Float.POSITIVE_INFINITY);
-            }
-            if (DoubleLiteral.NEG_INF_NAME.contains(trimmedValue.toLowerCase())) {
-                return Literal.of(Float.NEGATIVE_INFINITY);
-            }
-            if (DoubleLiteral.NAN_NAME.contains(trimmedValue.toLowerCase())) {
-                return Literal.of(Float.NaN);
-            }
-            return Literal.of(Float.parseFloat(value.trim()));
-        }
-        throw new CastException(String.format("%s can't cast to float in strict mode.", value));
+        // BE parses the string into a double and then narrows it to float, so round twice the same way
+        // instead of parsing directly to float, which can differ for a value next to a float midpoint.
+        return new DoubleLiteral(parseDouble("float")).uncheckedCastTo(FloatType.INSTANCE);
     }
 
     protected Expression castToDouble() {
-        String trimmedValue = value.trim();
-        if (doublePattern.matcher(trimmedValue).matches()) {
+        return Literal.of(parseDouble("double"));
+    }
+
+    private double parseDouble(String targetType) {
+        Matcher matcher = doublePattern.matcher(value);
+        if (matcher.matches()) {
+            String trimmedValue = matcher.group("number");
             if (DoubleLiteral.POS_INF_NAME.contains(trimmedValue.toLowerCase())) {
-                return Literal.of(Double.POSITIVE_INFINITY);
+                return Double.POSITIVE_INFINITY;
             }
             if (DoubleLiteral.NEG_INF_NAME.contains(trimmedValue.toLowerCase())) {
-                return Literal.of(Double.NEGATIVE_INFINITY);
+                return Double.NEGATIVE_INFINITY;
             }
-            if (DoubleLiteral.NAN_NAME.contains(trimmedValue.toLowerCase())) {
-                return Literal.of(Double.NaN);
+            if (DoubleLiteral.NAN_NAME.contains(trimNanPayload(trimmedValue).toLowerCase())) {
+                // fast_float negates the quiet NaN for a leading '-', which signbit() can observe
+                return trimmedValue.startsWith("-") ? Math.copySign(Double.NaN, -1.0) : Double.NaN;
             }
-            return Literal.of(Double.parseDouble(value.trim()));
+            return Double.parseDouble(trimmedValue);
         }
-        throw new CastException(String.format("%s can't cast to double in strict mode.", value));
+        throw new CastException(String.format("%s can't cast to %s in strict mode.", value, targetType));
+    }
+
+    private static String trimNanPayload(String number) {
+        int payloadStart = number.indexOf('(');
+        return payloadStart < 0 ? number : number.substring(0, payloadStart);
     }
 
     protected Expression castToBoolean() {
@@ -276,7 +267,7 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
         throw new CastException(String.format("%s can't cast to decimal in strict mode.", value));
     }
 
-    protected DateTimeV2Literal castToDateTime(DataType targetType, boolean strictCast, boolean isDatetime) {
+    protected DateLiteral castToDateTime(DataType targetType, boolean strictCast) {
         Matcher strictMatcher = dateStrictPattern.matcher(value);
         String year;
         String month;
@@ -315,17 +306,7 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
                         ? strictMatcher.group("fraction2") : strictMatcher.group("fraction1");
                 tz = strictMatcher.group("tz");
             }
-            if (tz != null && tz.equalsIgnoreCase("CST")) {
-                tz = "+08:00";
-            }
-            DateTimeV2Literal dt = getDateTimeLiteral(year, month, date, hour, minute, second,
-                    fraction, tz, targetType);
-            if (isDatetime) {
-                return dt;
-            } else {
-                return new DateTimeV2Literal(Long.parseLong(year2ToYear4(year)), Long.parseLong(month),
-                        Long.parseLong(date), 0, 0, 0);
-            }
+            return getDateTimeLiteral(year, month, date, hour, minute, second, fraction, tz, targetType);
         } else if (!strictCast) {
             Matcher unStrictMatcher = dateUnStrictPattern.matcher(value);
             if (unStrictMatcher.matches()) {
@@ -337,17 +318,7 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
                 second = unStrictMatcher.group("second");
                 fraction = unStrictMatcher.group("fraction");
                 tz = unStrictMatcher.group("tz");
-                if (tz != null && tz.equalsIgnoreCase("CST")) {
-                    tz = "+08:00";
-                }
-                DateTimeV2Literal dt = getDateTimeLiteral(year, month, date, hour, minute, second,
-                        fraction, tz, targetType);
-                if (isDatetime) {
-                    return dt;
-                } else {
-                    return new DateTimeV2Literal(Long.parseLong(year2ToYear4(year)), Long.parseLong(month),
-                            Long.parseLong(date), 0, 0, 0);
-                }
+                return getDateTimeLiteral(year, month, date, hour, minute, second, fraction, tz, targetType);
             }
         }
         throw new CastException(String.format("[%s] can't cast to %s.", value, targetType));
@@ -361,21 +332,10 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
         return year;
     }
 
-    protected DateTimeV2Literal getDateTimeLiteral(String year, String month, String date, String hour, String minute,
+    protected DateLiteral getDateTimeLiteral(String year, String month, String date, String hour, String minute,
             String second, String fraction, String tz, DataType targetType) {
         String year4 = year2ToYear4(year);
         tz = tz == null ? "" : tz;
-        if ((tz.startsWith("+") || tz.startsWith("-")) && !tz.contains(":")) {
-            if (tz.length() == 2) {
-                tz = String.format("%s0%s:00", tz.charAt(0), tz.charAt(1));
-            } else if (tz.length() == 3) {
-                tz = String.format("%s%s:00", tz.charAt(0), tz.substring(1, 3));
-            } else if (tz.length() == 4) {
-                tz = String.format("%s0%s:%s", tz.charAt(0), tz.charAt(1), tz.substring(2, 4));
-            } else {
-                tz = String.format("%s%s:%s", tz.charAt(0), tz.substring(1, 3), tz.substring(3, 5));
-            }
-        }
         hour = hour == null ? "00" : hour;
         minute = minute == null ? "00" : minute;
         second = second == null ? "00" : second;
@@ -383,18 +343,37 @@ public abstract class StringLikeLiteral extends Literal implements ComparableLit
         if (fraction.endsWith(".")) {
             fraction = fraction.substring(0, fraction.length() - 1);
         }
-        if (tz.contains(":")) {
-            int hourOffset = Integer.parseInt(tz.substring(1, tz.indexOf(":")));
-            int minuteOffset = Integer.parseInt(tz.substring(tz.indexOf(":") + 1));
-            if (hourOffset > 14 || hourOffset == 14 && minuteOffset > 0) {
-                throw new CastException("Time zone offset couldn't be larger than 14:00");
-            }
-        }
         String format = String.format("%s-%s-%sT%s:%s:%s%s%s", year4, month, date, hour, minute, second, fraction, tz);
-        try {
-            return new DateTimeV2Literal((DateTimeV2Type) targetType, format);
-        } catch (AnalysisException e) {
-            throw new CastException(e.getMessage(), e);
+        if (targetType.isDateType()) {
+            try {
+                return new DateLiteral(format);
+            } catch (AnalysisException e) {
+                throw new CastException(e.getMessage(), e);
+            }
+        } else if (targetType.isDateV2Type()) {
+            try {
+                return new DateV2Literal(format);
+            } catch (AnalysisException e) {
+                throw new CastException(e.getMessage(), e);
+            }
+        } else if (targetType.isDateTimeType()) {
+            try {
+                return new DateTimeLiteral(format);
+            } catch (AnalysisException e) {
+                throw new CastException(e.getMessage(), e);
+            }
+        } else if (targetType instanceof TimeStampNsType) {
+            try {
+                return new TimeStampNsLiteral(format);
+            } catch (AnalysisException e) {
+                throw new CastException(e.getMessage(), e);
+            }
+        } else {
+            try {
+                return new DateTimeV2Literal((DateTimeV2Type) targetType, format);
+            } catch (AnalysisException e) {
+                throw new CastException(e.getMessage(), e);
+            }
         }
     }
 

@@ -26,6 +26,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.MasterDaemon;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.nereids.trees.plans.commands.WarmUpClusterCommand;
@@ -47,7 +48,7 @@ import java.util.stream.Collectors;
 public class CloudInstanceStatusChecker extends MasterDaemon {
     private static final Logger LOG = LogManager.getLogger(CloudInstanceStatusChecker.class);
     private CloudSystemInfoService cloudSystemInfoService;
-    // if find vcg failed sync, record it timestamp, virtual compute group name <-> timestamp
+    // if find vcg failed sync, record it timestamp, virtual compute group id <-> timestamp
     private Map<String, Long> lastFailedSyncTimeMap = new ConcurrentHashMap<>();
 
     public CloudInstanceStatusChecker(CloudSystemInfoService cloudSystemInfoService) {
@@ -58,6 +59,12 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
     @Override
     protected void runAfterCatalogReady() {
         try {
+            if (DebugPointUtil.isEnable("CloudInstanceStatusChecker.runAfterCatalogReady.pause")) {
+                LOG.info("CloudInstanceStatusChecker.runAfterCatalogReady.pause phase={}",
+                        DebugPointUtil.getDebugParamOrDefault(
+                                "CloudInstanceStatusChecker.runAfterCatalogReady.pause", "phase", ""));
+                return;
+            }
             long start = System.currentTimeMillis();
             Cloud.GetInstanceResponse response = cloudSystemInfoService.getCloudInstance();
             if (!isResponseValid(response)) {
@@ -65,6 +72,17 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
             }
 
             Cloud.InstanceInfoPB instance = response.getInstance();
+            if (DebugPointUtil.isEnable("CloudInstanceStatusChecker.afterGetInstance.pause")
+                    && instance.getClustersList().stream().anyMatch(c -> c.getClusterId().equals(
+                            DebugPointUtil.getDebugParamOrDefault(
+                                    "CloudInstanceStatusChecker.afterGetInstance.pause", "cluster_id", "")))) {
+                LOG.info("CloudInstanceStatusChecker.afterGetInstance.pause phase={}",
+                        DebugPointUtil.getDebugParamOrDefault(
+                                "CloudInstanceStatusChecker.afterGetInstance.pause", "phase", ""));
+                while (DebugPointUtil.isEnable("CloudInstanceStatusChecker.afterGetInstance.pause")) {
+                    Thread.sleep(100);
+                }
+            }
             cloudSystemInfoService.setInstanceStatus(instance.getStatus());
             syncStorageVault(instance);
             processVirtualClusters(instance.getClustersList());
@@ -107,13 +125,19 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
         List<Cloud.ClusterPB> computeClusters = new ArrayList<>();
         categorizeClusters(clusters, virtualClusters, computeClusters);
         handleComputeClusters(computeClusters);
-        handleVirtualClusters(virtualClusters, computeClusters);
+        Map<String, Cloud.ClusterPB> computeClustersByName = computeClusters.stream()
+                .collect(Collectors.toMap(Cloud.ClusterPB::getClusterName, computeCluster -> computeCluster));
+        Map<String, String> computeClusterIdsByNameInFe = cloudSystemInfoService.getCloudClusterNameToId(false);
+        List<Cloud.ClusterPB> reconciledVirtualClusters =
+                handleVirtualClusters(virtualClusters, computeClustersByName, computeClusterIdsByNameInFe);
+        // A rejected update still proves that the group exists in MS, so use the full snapshot for removal.
         removeObsoleteVirtualGroups(virtualClusters);
+        cloudSystemInfoService.refreshComputeGroupNames(reconciledVirtualClusters);
     }
 
     private void handleComputeClusters(List<Cloud.ClusterPB> computeClusters) {
         for (Cloud.ClusterPB computeClusterInMs : computeClusters) {
-            ComputeGroup computeGroupInFe = cloudSystemInfoService
+            CloudComputeGroupMeta computeGroupInFe = cloudSystemInfoService
                     .getComputeGroupById(computeClusterInMs.getClusterId());
             if (computeGroupInFe == null) {
                 // cluster checker will sync it
@@ -121,45 +145,9 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
                         + "it may be wait cluster checker to sync, ignore it",
                         computeClusterInMs);
             } else {
-                // exist compute group, check properties changed and update if needed
-                updatePropertiesIfChanged(computeGroupInFe, computeClusterInMs);
+                // exist compute group, resync properties from the authoritative MS snapshot
+                computeGroupInFe.setProperties(computeClusterInMs.getPropertiesMap());
             }
-        }
-    }
-
-    /**
-     * Compare properties between compute cluster in MS and compute group in FE,
-     * update only the changed key-value pairs to avoid unnecessary updates.
-     */
-    private void updatePropertiesIfChanged(ComputeGroup computeGroupInFe, Cloud.ClusterPB computeClusterInMs) {
-        Map<String, String> propertiesInMs = computeClusterInMs.getPropertiesMap();
-        Map<String, String> propertiesInFe = computeGroupInFe.getProperties();
-
-        if (propertiesInMs == null || propertiesInMs.isEmpty()) {
-            return;
-        }
-        Map<String, String> changedProperties = new HashMap<>();
-
-        // Check for changed or new properties
-        for (Map.Entry<String, String> entry : propertiesInMs.entrySet()) {
-            String key = entry.getKey();
-            String valueInMs = entry.getValue();
-            String valueInFe = propertiesInFe.get(key);
-
-            if (valueInFe != null && valueInFe.equalsIgnoreCase(valueInMs)) {
-                continue;
-            }
-            changedProperties.put(key, valueInMs);
-
-            LOG.debug("Property changed for compute group {}: {} = {} (was: {})",
-                    computeGroupInFe.getName(), key, valueInMs, valueInFe);
-        }
-
-        // Only update if there are actual changes
-        if (!changedProperties.isEmpty()) {
-            LOG.info("Updating properties for compute group {}: {}",
-                    computeGroupInFe.getName(), changedProperties);
-            computeGroupInFe.setProperties(changedProperties);
         }
     }
 
@@ -179,15 +167,26 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
         }
     }
 
-    private void handleVirtualClusters(List<Cloud.ClusterPB> virtualGroups, List<Cloud.ClusterPB> computeClusters) {
+    private List<Cloud.ClusterPB> handleVirtualClusters(List<Cloud.ClusterPB> virtualGroups,
+                                       Map<String, Cloud.ClusterPB> computeClustersByName,
+                                       Map<String, String> computeClusterIdsByNameInFe) {
+        List<Cloud.ClusterPB> reconciledGroups = new ArrayList<>();
         for (Cloud.ClusterPB virtualGroupInMs : virtualGroups) {
-            ComputeGroup virtualGroupInFe = cloudSystemInfoService
+            CloudComputeGroupMeta virtualGroupInFe = cloudSystemInfoService
                     .getComputeGroupById(virtualGroupInMs.getClusterId());
+            boolean reconciled;
             if (virtualGroupInFe != null) {
-                handleExistingVirtualComputeGroup(virtualGroupInMs, virtualGroupInFe);
+                reconciled = handleExistingVirtualComputeGroup(virtualGroupInMs, virtualGroupInFe,
+                        computeClustersByName, computeClusterIdsByNameInFe);
             } else {
-                handleNewVirtualComputeGroup(virtualGroupInMs, computeClusters);
+                reconciled = handleNewVirtualComputeGroup(virtualGroupInMs,
+                        computeClustersByName, computeClusterIdsByNameInFe);
             }
+            // Rejected renames must not publish a name for metadata whose update was rejected.
+            if (!reconciled) {
+                continue;
+            }
+            reconciledGroups.add(virtualGroupInMs);
             // just fe master gen file cache sync task
             if (Env.getCurrentEnv().isMaster()) {
                 // get again in fe mem
@@ -201,10 +200,16 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
                 syncFileCacheTasksForVirtualGroup(virtualGroupInMs, virtualGroupInFe);
             }
         }
+        return reconciledGroups;
     }
 
-    private void cancelCacheJobs(ComputeGroup vcgInFe, List<String> jobIds) {
+    private void cancelCacheJobs(CloudComputeGroupMeta vcgInFe, List<String> jobIds) {
         CacheHotspotManager cacheHotspotManager = ((CloudEnv) Env.getCurrentEnv()).getCacheHotspotMgr();
+        if (!jobIds.isEmpty()) {
+            LOG.info("warmup-vcg cancel-cache-jobs vcgName={} activeComputeGroup={} standbyComputeGroup={} "
+                            + "jobIds={}",
+                    vcgInFe.getName(), vcgInFe.getActiveComputeGroup(), vcgInFe.getStandbyComputeGroup(), jobIds);
+        }
         for (String jobId : jobIds) {
             try {
                 if (Env.getCurrentEnv().isMaster()) {
@@ -219,7 +224,7 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
         }
     }
 
-    private void checkNeedRebuildFileCache(ComputeGroup virtualGroupInFe, List<String> jobIdsInMs) {
+    private void checkNeedRebuildFileCache(CloudComputeGroupMeta virtualGroupInFe, List<String> jobIdsInMs) {
         CacheHotspotManager cacheHotspotManager = ((CloudEnv) Env.getCurrentEnv()).getCacheHotspotMgr();
         // check jobIds in Ms valid, if been cancelled, start new jobs
         for (String jobId : jobIdsInMs) {
@@ -267,7 +272,8 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
     /**
      * Generates and synchronizes file cache related tasks for virtual computing groups on the FE master.
      */
-    private void syncFileCacheTasksForVirtualGroup(Cloud.ClusterPB virtualGroupInMs, ComputeGroup virtualGroupInFe) {
+    private void syncFileCacheTasksForVirtualGroup(
+            Cloud.ClusterPB virtualGroupInMs, CloudComputeGroupMeta virtualGroupInFe) {
         if (!virtualGroupInMs.hasClusterPolicy()) {
             LOG.warn("virtual compute err, clusterName {}, no cluster policy {}",
                     virtualGroupInFe.getName(), virtualGroupInMs);
@@ -285,6 +291,10 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
             String srcCg = virtualGroupInFe.getActiveComputeGroup();
             String dstCg = virtualGroupInFe.getStandbyComputeGroup();
             try {
+                LOG.info("warmup-vcg rebuild-start vcgName={} srcCluster={} dstCluster={} subComputeGroups={} "
+                                + "oldJobIds={}",
+                        virtualGroupInFe.getName(), srcCg, dstCg, virtualGroupInFe.getSubComputeGroups(),
+                        jobIdsInMs);
                 cacheHotspotManager.cancelTableLevelLoadEventWarmUpJobsForVirtualComputeGroup(
                         virtualGroupInFe.getName(), srcCg, dstCg, virtualGroupInFe.getSubComputeGroups(),
                         "vcg cancel table-level load-event warm up job before rebuilding file cache jobs");
@@ -316,35 +326,52 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
                 long jobIdEvent = cacheHotspotManager.createJob(eventStmtPeriodic);
                 // send jobIds to ms
                 List<String> newJobIds = Arrays.asList(Long.toString(jobIdPeriodic), Long.toString(jobIdEvent));
-                CloudSystemInfoService.updateFileCacheJobIds(virtualGroupInFe, newJobIds);
-                LOG.info("virtual compute group {}, generate new jobIds periodic={}, event={}, and old jobIds {}",
-                        virtualGroupInFe, jobIdPeriodic, jobIdEvent, jobIdsInMs);
+                boolean updated = CloudSystemInfoService.updateFileCacheJobIds(virtualGroupInFe, newJobIds);
+                if (!updated) {
+                    LOG.warn("warmup-vcg rebuild-failed vcgName={} srcCluster={} dstCluster={} "
+                                    + "createdPeriodicJobId={} createdEventJobId={} oldJobIds={} "
+                                    + "failureReason=failed to update new job ids to ms",
+                            virtualGroupInFe.getName(), srcCg, dstCg, jobIdPeriodic, jobIdEvent, jobIdsInMs);
+                    cancelCacheJobs(virtualGroupInFe, newJobIds);
+                    return;
+                }
+                virtualGroupInFe.getPolicy().setCacheWarmupJobIds(newJobIds);
+                LOG.info("warmup-vcg rebuild-finish vcgName={} srcCluster={} dstCluster={} "
+                                + "createdPeriodicJobId={} createdEventJobId={} oldJobIds={}",
+                        virtualGroupInFe.getName(), srcCg, dstCg, jobIdPeriodic, jobIdEvent, jobIdsInMs);
             } catch (AnalysisException e) {
-                LOG.warn("virtual compute err, name: {}, failed to generate file cache warm up jobs: {}",
-                        virtualGroupInFe.getName(), e.getMessage(), e);
+                LOG.warn("warmup-vcg rebuild-failed vcgName={} srcCluster={} dstCluster={} oldJobIds={} "
+                                + "failureReason={}",
+                        virtualGroupInFe.getName(), srcCg, dstCg, jobIdsInMs, e.getMessage(), e);
                 return;
             }
             virtualGroupInFe.setNeedRebuildFileCache(false);
         }
     }
 
-    private void handleExistingVirtualComputeGroup(Cloud.ClusterPB clusterInMs, ComputeGroup virtualGroupInFe) {
+    private boolean handleExistingVirtualComputeGroup(
+            Cloud.ClusterPB clusterInMs, CloudComputeGroupMeta virtualGroupInFe,
+            Map<String, Cloud.ClusterPB> computeClustersByName,
+            Map<String, String> computeClusterIdsByNameInFe) {
         if (!isClusterIdConsistent(clusterInMs, virtualGroupInFe)) {
-            return;
+            return false;
         }
 
         if (!isClusterPolicyValid(clusterInMs)) {
-            return;
+            return false;
         }
 
         if (!areSubComputeGroupsValid(clusterInMs, virtualGroupInFe)) {
-            return;
+            return false;
         }
 
+        checkSubClusters(clusterInMs.getClusterNamesList(), clusterInMs,
+                computeClustersByName, computeClusterIdsByNameInFe);
         diffAndUpdateComputeGroup(clusterInMs, virtualGroupInFe);
+        return true;
     }
 
-    private boolean isClusterIdConsistent(Cloud.ClusterPB cluster, ComputeGroup computeGroup) {
+    private boolean isClusterIdConsistent(Cloud.ClusterPB cluster, CloudComputeGroupMeta computeGroup) {
         if (!cluster.getClusterId().equals(computeGroup.getId())) {
             LOG.warn("virtual compute err, group id changed, in fe={} but in ms={}, "
                     + "verbose {}, please check it",
@@ -371,7 +398,7 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
         return true;
     }
 
-    private boolean areSubComputeGroupsValid(Cloud.ClusterPB clusterInMs, ComputeGroup virtualGroupInFe) {
+    private boolean areSubComputeGroupsValid(Cloud.ClusterPB clusterInMs, CloudComputeGroupMeta virtualGroupInFe) {
         List<String> subComputeGroups = clusterInMs.getClusterNamesList();
         if (subComputeGroups.isEmpty() || virtualGroupInFe.getSubComputeGroups() == null) {
             LOG.warn("virtual compute err, please check it, verbose {}", virtualGroupInFe);
@@ -385,7 +412,7 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
         return true;
     }
 
-    private void diffAndUpdateComputeGroup(Cloud.ClusterPB cluster, ComputeGroup computeGroup) {
+    private void diffAndUpdateComputeGroup(Cloud.ClusterPB cluster, CloudComputeGroupMeta computeGroup) {
         // vcg rename logic, here cluster_id same, but cluster_name changed, so vcg renamed
         String clusterNameInMs = cluster.getClusterName();
         String computeGroupNameInFe = computeGroup.getName();
@@ -456,33 +483,35 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
         }
     }
 
-    private void handleNewVirtualComputeGroup(Cloud.ClusterPB cluster, List<Cloud.ClusterPB> computeClusters) {
+    private boolean handleNewVirtualComputeGroup(
+            Cloud.ClusterPB cluster, Map<String, Cloud.ClusterPB> computeClustersByName,
+            Map<String, String> computeClusterIdsByNameInFe) {
         List<String> subComputeGroups = cluster.getClusterNamesList();
         if (subComputeGroups.isEmpty()) {
             LOG.info("found virtual cluster {} which has no sub clusters, skip empty virtual cluster", cluster);
-            return;
+            return false;
         }
         if (subComputeGroups.size() != 2) {
             LOG.warn("virtual compute err, sub compute group size not eq 2, in ms {}", subComputeGroups);
-            return;
+            return false;
         }
         if (!cluster.hasClusterPolicy()) {
             LOG.warn("virtual compute err, no cluster policy {}", cluster);
-            return;
+            return false;
         }
         if (!cluster.getClusterPolicy().hasActiveClusterName()) {
             LOG.warn("virtual compute err, active cluster empty in ms {}", cluster);
-            return;
+            return false;
         }
         if (cluster.getClusterPolicy().getStandbyClusterNamesList().size() != 1) {
             LOG.warn("virtual compute err, standby cluster size not eq 1 in ms {}", cluster);
-            return;
+            return false;
         }
-        checkSubClusters(subComputeGroups, cluster, computeClusters);
-        ComputeGroup computeGroup = new ComputeGroup(cluster.getClusterId(),
-                cluster.getClusterName(), ComputeGroup.ComputeTypeEnum.VIRTUAL);
+        checkSubClusters(subComputeGroups, cluster, computeClustersByName, computeClusterIdsByNameInFe);
+        CloudComputeGroupMeta computeGroup = new CloudComputeGroupMeta(cluster.getClusterId(),
+                cluster.getClusterName(), CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
         computeGroup.setSubComputeGroups(new ArrayList<>(subComputeGroups));
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(cluster.getClusterPolicy().getActiveClusterName());
         policy.setStandbyComputeGroup(cluster.getClusterPolicy().getStandbyClusterNames(0));
         policy.setFailoverFailureThreshold(cluster.getClusterPolicy().getFailoverFailureThreshold());
@@ -491,35 +520,49 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
         computeGroup.setNeedRebuildFileCache(true);
         cloudSystemInfoService.addComputeGroup(cluster.getClusterId(), computeGroup);
         MetricRepo.registerCloudMetrics(cluster.getClusterId(), cluster.getClusterName());
+        return true;
     }
 
     private void checkSubClusters(List<String> subClusterNames, Cloud.ClusterPB cluster,
-                                  List<Cloud.ClusterPB> computeClustersInPB) {
+                                  Map<String, Cloud.ClusterPB> computeClustersByName,
+                                  Map<String, String> computeClusterIdsByNameInFe) {
+        boolean allSubClustersExist = true;
         for (String subClusterName : subClusterNames) {
-            if (cloudSystemInfoService.getCloudClusterIdByName(subClusterName) == null) {
-                handleFailedSync(cluster, subClusterName, computeClustersInPB);
-                continue;
+            Cloud.ClusterPB subClusterInMs = computeClustersByName.get(subClusterName);
+            String subClusterIdInFe = computeClusterIdsByNameInFe.get(subClusterName);
+            boolean sameSubClusterInFe = subClusterInMs != null
+                    && subClusterInMs.getClusterId().equals(subClusterIdInFe);
+            // Empty compute groups exist only in MS because FE builds its mapping from BE nodes.
+            boolean emptySubClusterOnlyInMs = subClusterInMs != null && subClusterInMs.getNodesCount() == 0
+                    && subClusterIdInFe == null;
+            if (!sameSubClusterInFe && !emptySubClusterOnlyInMs) {
+                allSubClustersExist = false;
+                handleFailedSync(cluster, subClusterName, subClusterInMs, subClusterIdInFe);
             }
-            // CloudClusterChecker find sub compute group
-            lastFailedSyncTimeMap.remove(cluster.getClusterName());
+        }
+        if (allSubClustersExist) {
+            lastFailedSyncTimeMap.remove(cluster.getClusterId());
         }
     }
 
     private void handleFailedSync(Cloud.ClusterPB cluster, String subClusterName,
-                                  List<Cloud.ClusterPB> computeClustersInPB) {
-        if (!lastFailedSyncTimeMap.containsKey(cluster.getClusterName())) {
-            lastFailedSyncTimeMap.put(cluster.getClusterName(), System.currentTimeMillis());
+                                  Cloud.ClusterPB subClusterInMs, String subClusterIdInFe) {
+        if (!lastFailedSyncTimeMap.containsKey(cluster.getClusterId())) {
+            lastFailedSyncTimeMap.put(cluster.getClusterId(), System.currentTimeMillis());
         } else {
-            List<String> computeGroupsInPb = computeClustersInPB.stream()
-                    .map(Cloud.ClusterPB::getClusterName).collect(Collectors.toList());
-            if (computeGroupsInPb.contains(subClusterName)) {
+            if (subClusterInMs == null) {
+                LOG.warn("ms cant find {}, current fe cluster id: {}, it may be dropped or renamed",
+                        subClusterName, subClusterIdInFe);
+            } else if (subClusterIdInFe == null) {
                 LOG.warn("fe mem cant find {}, it may be wait cluster check to sync", subClusterName);
             } else {
-                LOG.warn("fe mem and ms cant find {}, it may be dropped or renamed", subClusterName);
+                LOG.warn("sub cluster id mismatch for {}, fe id: {}, ms id: {}, "
+                                + "it may be wait cluster check to sync",
+                        subClusterName, subClusterIdInFe, subClusterInMs.getClusterId());
             }
             // sub cluster may be dropped or rename, or fe may be slowly,
             // need manual intervention
-            if (System.currentTimeMillis() - lastFailedSyncTimeMap.get(cluster.getClusterName())
+            if (System.currentTimeMillis() - lastFailedSyncTimeMap.get(cluster.getClusterId())
                     > 3 * Config.cloud_cluster_check_interval_second * 1000L) {
                 LOG.warn("virtual compute err, cant find cluster info by cluster checker, "
                         + "sub cluster: {}, virtual cluster: {}", subClusterName, cluster.getClusterName());
@@ -530,10 +573,11 @@ public class CloudInstanceStatusChecker extends MasterDaemon {
     private void removeObsoleteVirtualGroups(List<Cloud.ClusterPB> virtualClusters) {
         List<String> msVirtualClusters = virtualClusters.stream().map(Cloud.ClusterPB::getClusterId)
                 .collect(Collectors.toList());
-        for (ComputeGroup computeGroup : cloudSystemInfoService.getComputeGroups(true)) {
+        for (CloudComputeGroupMeta computeGroup : cloudSystemInfoService.getComputeGroups(true)) {
             // in fe mem, but not in meta server
             if (!msVirtualClusters.contains(computeGroup.getId())) {
                 LOG.info("virtual compute group {} will be removed.", computeGroup.getName());
+                lastFailedSyncTimeMap.remove(computeGroup.getId());
                 MetricRepo.unregisterCloudMetrics(computeGroup.getId(), computeGroup.getName(),
                         Collections.emptyList());
                 cloudSystemInfoService.removeComputeGroup(computeGroup.getId(), computeGroup.getName());

@@ -19,17 +19,36 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <memory>
 
+#include "common/cast_set.h"
 #include "exec/operator/olap_scan_operator.h"
 #include "exec/operator/scan_operator.h"
-#include "exec/scan/file_scanner.h"
+#include "exec/scan/file_scan_range_utils.h"
+#include "exec/scan/file_scanner_v2.h"
 #include "exec/scan/scanner_context.h"
 #include "format/format_common.h"
+#include "format_v2/parquet/parquet_profile.h"
+#include "storage/id_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet/tablet_manager.h"
 
 namespace doris {
+namespace {
+
+// The most file scanners one instance of a file scan node runs: the max_file_scanners_concurrency
+// session variable, 16 when it is not set.
+int file_scanners_per_instance(RuntimeState* state) {
+    return state->max_file_scanners_concurrency() > 0 ? state->max_file_scanners_concurrency() : 16;
+}
+
+} // namespace
+
+FileScanLocalState::FileScanLocalState(RuntimeState* state, OperatorXBase* parent)
+        : ScanLocalState<FileScanLocalState>(state, parent) {}
+
+FileScanLocalState::~FileScanLocalState() = default;
 
 PushDownType FileScanLocalState::_should_push_down_binary_predicate(
         VectorizedFnCall* fn_call, VExprContext* expr_ctx, Field& constant_val,
@@ -41,11 +60,9 @@ PushDownType FileScanLocalState::_should_push_down_binary_predicate(
     DCHECK(children.size() == 2);
     DCHECK_EQ(children[0]->node_type(), TExprNodeType::SLOT_REF);
     if (children[1]->is_constant()) {
-        std::shared_ptr<ColumnPtrWrapper> const_col_wrapper;
+        std::shared_ptr<ConstantExprResult> const_col_wrapper;
         THROW_IF_ERROR(children[1]->get_const_col(expr_ctx, &const_col_wrapper));
-        const auto* const_column =
-                assert_cast<const ColumnConst*>(const_col_wrapper->column_ptr.get());
-        constant_val = const_column->operator[](0);
+        constant_val = const_col_wrapper->column()[0];
         return PushDownType::PARTIAL_ACCEPTABLE;
     } else {
         // only handle constant value
@@ -76,8 +93,7 @@ int FileScanLocalState::max_scanners_concurrency(RuntimeState* state) const {
      *
      * If this is a serial operator, the max concurrency should multiply by the number of parallel instances of the operator.
      */
-    return (state->max_file_scanners_concurrency() > 0 ? state->max_file_scanners_concurrency()
-                                                       : 16) *
+    return file_scanners_per_instance(state) *
            (state->query_parallel_instance_num() / _parent->parallelism(state));
 }
 
@@ -113,15 +129,20 @@ Status FileScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
     }
 
     auto& p = _parent->cast<FileScanOperatorX>();
-    // There's only one scan range for each backend in batch split mode. Each backend only starts up one ScanNode instance.
-    uint32_t shard_num =
-            std::min(ScannerScheduler::default_remote_scan_thread_num() / p.parallelism(state()),
-                     _max_scanners);
-    shard_num = std::max(shard_num, 1U);
-    _kv_cache = std::make_unique<ShardedKVCache>(shard_num);
+    DORIS_CHECK(p._kv_cache != nullptr);
+    const TFileScanRangeParams* scan_params = nullptr;
+    if (state()->get_query_ctx() != nullptr &&
+        state()->get_query_ctx()->file_scan_range_params_map.count(parent_id()) > 0) {
+        scan_params = &state()->get_query_ctx()->file_scan_range_params_map[parent_id()];
+    } else {
+        scan_params = _split_source->get_params();
+    }
+    RETURN_IF_ERROR(validate_file_scan_support(*scan_params));
+    _parquet_profile_cache =
+            std::make_unique<format::parquet::ParquetProfileCache>(_scanner_profile.get());
     for (int i = 0; i < _max_scanners; ++i) {
-        std::unique_ptr<FileScanner> scanner = FileScanner::create_unique(
-                state(), this, p._limit, _split_source, _scanner_profile.get(), _kv_cache.get(),
+        ScannerSPtr scanner = FileScannerV2::create_shared(
+                state(), this, p._limit, _split_source, _scanner_profile.get(), p._kv_cache.get(),
                 &p._colname_to_slot_id);
         RETURN_IF_ERROR(scanner->init(state(), _conjuncts));
         scanners->push_back(std::move(scanner));
@@ -208,6 +229,18 @@ Status FileScanLocalState::_process_conjuncts(RuntimeState* state) {
 
 Status FileScanOperatorX::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(ScanOperatorX<FileScanLocalState>::prepare(state));
+    // Sharded for the scanners that can reach the cache at once, which are now every instance's:
+    // as many as the per-instance caches it replaces had between them. That is the fragment's
+    // instances, not this operator's parallelism: a serial operator has one instance, and it runs
+    // the scanners of all of them (max_scanners_concurrency). Counted in 64 bits: the scanners per
+    // instance are a session variable with no upper bound, and in an int the product overflows
+    // before std::min can cap it, leaving the whole node one shard to load under.
+    const int64_t shard_num =
+            std::min<int64_t>(ScannerScheduler::default_remote_scan_thread_num(),
+                              static_cast<int64_t>(state->query_parallel_instance_num()) *
+                                      file_scanners_per_instance(state));
+    _kv_cache =
+            std::make_unique<ShardedKVCache>(cast_set<uint32_t>(std::max<int64_t>(shard_num, 1)));
     if (state->get_query_ctx() != nullptr &&
         state->get_query_ctx()->file_scan_range_params_map.contains(node_id())) {
         TFileScanRangeParams& params =

@@ -34,7 +34,6 @@
 
 #include "common/config.h"
 #include "load/group_commit/wal/wal_dirs_info.h"
-#include "load/group_commit/wal/wal_reader.h"
 #include "load/group_commit/wal/wal_table.h"
 #include "load/group_commit/wal/wal_writer.h"
 #include "load/stream_load/stream_load_context.h"
@@ -80,6 +79,7 @@ public:
     void add_wal_queue(int64_t table_id, int64_t wal_id);
     void erase_wal_queue(int64_t table_id, int64_t wal_id);
     size_t get_wal_queue_size(int64_t table_id);
+    std::string get_last_replay_wal_failed_reason(int64_t table_id);
     // filename format:a_b_c_group_commit_xxx
     // a:version
     // b:be id

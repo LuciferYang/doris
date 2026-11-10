@@ -29,15 +29,18 @@
 #include "common/status.h"
 #include "core/data_type/data_type.h"
 #include "core/data_type/define_primitive_type.h"
+#include "core/data_type/storage_field_type.h"
 #include "core/string_ref.h"
 #include "io/fs/file_reader_writer_fwd.h"
 #include "storage/metadata_adder.h"
 #include "storage/tablet/tablet_schema.h"
+#include "storage/types.h"
 #include "util/once.h"
 
 namespace doris {
 namespace io {
 class FileWriter;
+struct IOContext;
 } // namespace io
 
 namespace segment_v2 {
@@ -94,7 +97,7 @@ public:
 
     virtual ~ZoneMapIndexWriter() = default;
 
-    virtual void add_values(const void* values, size_t count) = 0;
+    virtual void add_values(const uint8_t* values, size_t count) = 0;
 
     virtual void add_nulls(uint32_t count) = 0;
 
@@ -117,11 +120,12 @@ public:
 template <PrimitiveType Type>
 class TypedZoneMapIndexWriter final : public ZoneMapIndexWriter {
 public:
-    using ValType = std::conditional_t<is_string_type(Type), StringRef,
-                                       typename PrimitiveTypeTraits<Type>::StorageFieldType>;
+    using ValType = std::conditional_t<
+            is_string_type(Type), StringRef,
+            typename StorageTypeTraits<primitive_type_to_storage_field_type(Type)>::StorageType>;
     explicit TypedZoneMapIndexWriter(DataTypePtr&& data_type);
 
-    void add_values(const void* values, size_t count) override;
+    void add_values(const uint8_t* values, size_t count) override;
 
     void add_nulls(uint32_t count) override { _page_zone_map.has_null = true; }
 
@@ -182,7 +186,8 @@ public:
 
     // load all page zone maps into memory
     Status load(bool use_page_cache, bool kept_in_memory,
-                OlapReaderStatistics* index_load_stats = nullptr);
+                OlapReaderStatistics* index_load_stats = nullptr,
+                const io::IOContext* io_ctx = nullptr);
 
     const std::vector<ZoneMapPB>& page_zone_maps() const { return _page_zone_maps; }
 
@@ -190,7 +195,7 @@ public:
 
 private:
     Status _load(bool use_page_cache, bool kept_in_memory, std::unique_ptr<IndexedColumnMetaPB>,
-                 OlapReaderStatistics* index_load_stats);
+                 OlapReaderStatistics* index_load_stats, const io::IOContext* io_ctx);
 
     int64_t get_metadata_size() const override;
 

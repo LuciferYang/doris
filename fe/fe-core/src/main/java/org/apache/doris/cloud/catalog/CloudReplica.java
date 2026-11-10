@@ -23,6 +23,7 @@ import org.apache.doris.catalog.Replica;
 import org.apache.doris.cloud.qe.ComputeGroupException;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.persist.gson.GsonPostProcessable;
@@ -30,6 +31,8 @@ import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.base.Strings;
+import com.google.common.collect.Interner;
+import com.google.common.collect.Interners;
 import com.google.common.hash.HashCode;
 import com.google.common.hash.Hashing;
 import com.google.gson.annotations.SerializedName;
@@ -44,11 +47,16 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 public class CloudReplica extends Replica implements GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(CloudReplica.class);
+
+    // Routes keep shared objects alive; weak interners release IDs after their last route disappears.
+    private static final Interner<String> SHARED_CLUSTER_IDS = Interners.newWeakInterner();
+    private static final Interner<Long> SHARED_BACKEND_IDS = Interners.newWeakInterner();
 
     // a replica is mapped to one BE in a cluster, use primaryClusterToBackend instead of primaryClusterToBackends
     @Deprecated
@@ -107,6 +115,21 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
         return Env.getCurrentColocateIndex().isColocateTableNoLock(tableId);
     }
 
+    private boolean isDecommissioningOrDecommissioned(Backend be) {
+        boolean decommissioning = be.isDecommissioning();
+        boolean decommissioned = be.isDecommissioned();
+        if ((decommissioning || decommissioned) && LOG.isDebugEnabled()) {
+            LOG.debug("backend {} is filtered by decommission state, decommissioning={}, decommissioned={}, "
+                            + "replica info {}",
+                    be.getId(), decommissioning, decommissioned, this);
+        }
+        return decommissioning || decommissioned;
+    }
+
+    private boolean isQueryAvailableAndNotDecommissioning(Backend be) {
+        return be != null && be.isQueryAvailable() && !isDecommissioningOrDecommissioned(be);
+    }
+
     public long getColocatedBeId(String clusterId) throws ComputeGroupException {
         List<Backend> clusterBackends = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
                 .getBackendsByClusterId(clusterId);
@@ -118,8 +141,9 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
     // groups (e.g. the colocate proc display) fetch each group's backends only once.
     public long getColocatedBeId(String clusterId, List<Backend> clusterBackends) throws ComputeGroupException {
         CloudSystemInfoService infoService = ((CloudSystemInfoService) Env.getCurrentSystemInfo());
-        List<Backend> bes = clusterBackends.stream()
-                .filter(be -> be.isQueryAvailable()).collect(Collectors.toList());
+        // Do not filter by isQueryAvailable() here. Recently-dead BEs must stay in
+        // the hash ring during the grace period to avoid unnecessary full rehash.
+        List<Backend> bes = clusterBackends;
         String clusterName = infoService.getClusterNameByClusterId(clusterId);
         if (bes.isEmpty()) {
             LOG.warn("failed to get available be, cluster: {}-{}", clusterName, clusterId);
@@ -131,7 +155,7 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
         List<Backend> decommissionAvailBes = new ArrayList<>();
         for (Backend be : bes) {
             if (be.isAlive()) {
-                if (be.isDecommissioned()) {
+                if (isDecommissioningOrDecommissioned(be)) {
                     decommissionAvailBes.add(be);
                 } else {
                     availableBes.add(be);
@@ -150,28 +174,54 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
         }
 
         GroupId groupId = Env.getCurrentColocateIndex().getGroupNoLock(tableId);
-        HashCode hashCode = Hashing.murmur3_128().hashLong(groupId.grpId);
         if (availableBes.size() != bes.size()) {
-            // some be is dead recently, still hash tablets on all backends.
             long needRehashDeadTime = System.currentTimeMillis() - Config.rehash_tablet_after_be_dead_seconds * 1000L;
             if (bes.stream().anyMatch(be -> !be.isAlive() && be.getLastUpdateMs() > needRehashDeadTime)) {
                 List<Backend> beAliveOrDeadShort = bes.stream()
                         .filter(be -> be.isAlive() || be.getLastUpdateMs() > needRehashDeadTime)
                         .collect(Collectors.toList());
-                long index = getIndexByBeNum(hashCode.asLong() + idx, beAliveOrDeadShort.size());
-                Backend be = beAliveOrDeadShort.get((int) index);
-                if (be.isAlive() && !be.isDecommissioned()) {
+                Backend be = pickColocatedBackendForDeadGrace(infoService, groupId, clusterId, beAliveOrDeadShort);
+                if (be.isAlive() && !isDecommissioningOrDecommissioned(be)) {
                     return be.getId();
                 }
             }
         }
 
-        // Tablets with the same idx will be hashed to the same BE, which
-        // meets the requirements of colocated table.
-        long index = getIndexByBeNum(hashCode.asLong() + idx, availableBes.size());
-        long pickedBeId = availableBes.get((int) index).getId();
+        return pickColocatedBackend(infoService, groupId, clusterId, availableBes).getId();
+    }
 
-        return pickedBeId;
+    private Backend pickColocatedBackendForDeadGrace(CloudSystemInfoService infoService, GroupId groupId,
+            String clusterId, List<Backend> availableBes) {
+        if (!Config.enable_cloud_colocate_consistent_hash) {
+            return pickColocatedBackend(infoService, groupId, clusterId, availableBes);
+        }
+        int bucketNum = infoService.getCloudColocateBucketsNum(groupId);
+        CloudSystemInfoService.checkCloudColocateBucketIdx(groupId, clusterId, idx, bucketNum);
+        long[] availableBeIds = availableBes.stream().mapToLong(Backend::getId).toArray();
+        long pickedBeId = CloudColocatePlacement.pickBackendId(groupId.grpId, idx, availableBeIds);
+        return findPickedBackend(pickedBeId, groupId, clusterId, availableBes);
+    }
+
+    Backend pickColocatedBackend(CloudSystemInfoService infoService, GroupId groupId, String clusterId,
+            List<Backend> availableBes) {
+        if (Config.enable_cloud_colocate_consistent_hash) {
+            List<Long> availableBeIds = availableBes.stream().map(Backend::getId).collect(Collectors.toList());
+            long pickedBeId = infoService.getCloudColocateHrwBeId(groupId, clusterId, availableBeIds, idx);
+            return findPickedBackend(pickedBeId, groupId, clusterId, availableBes);
+        }
+
+        HashCode hashCode = Hashing.murmur3_128().hashLong(groupId.grpId);
+        long index = getIndexByBeNum(hashCode.asLong() + idx, availableBes.size());
+        return availableBes.get((int) index);
+    }
+
+    private Backend findPickedBackend(long pickedBeId, GroupId groupId, String clusterId, List<Backend> availableBes) {
+        return availableBes.stream().filter(be -> be.getId() == pickedBeId).findFirst()
+                .orElseThrow(() -> new IllegalStateException(String.format(
+                        "picked colocate backend %s is not in candidate set, group %s, cluster %s, bucket idx %s, "
+                                + "candidate backend ids %s",
+                        pickedBeId, groupId, clusterId, idx,
+                        availableBes.stream().map(Backend::getId).collect(Collectors.toList()))));
     }
 
     @Override
@@ -240,6 +290,10 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
         return primaryClusterToBackend.getOrDefault(clusterId, -1L);
     }
 
+    Long getNonColocatedPrimaryBackendId(String clusterId) {
+        return primaryClusterToBackend.get(clusterId);
+    }
+
     // For proc display only. In cloud mode a replica is hashed to a different BE in each
     // compute group, so expose a clusterId -> backendId mapping; the proc display builds
     // a separate bucket sequence per compute group from it so each group's sequence is
@@ -294,6 +348,10 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
             int indexRand = rand.nextInt(Config.cloud_replica_num);
 
             List<Long> res = hashReplicaToBes(clusterId, false, Config.cloud_replica_num);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("rehash multi replica backend, clusterId {}, replica info {}, indexRand {}, hashedBes {}",
+                        clusterId, this, indexRand, res);
+            }
             if (res.size() < indexRand + 1) {
                 if (res.isEmpty()) {
                     return -1;
@@ -307,14 +365,14 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
 
         // use primaryClusterToBackend, if find be normal
         Backend be = getPrimaryBackend(clusterId, false);
-        if (be != null && be.isQueryAvailable()) {
+        if (isQueryAvailableAndNotDecommissioning(be)) {
             return be.getId();
         }
 
         if (!Config.enable_immediate_be_assign) {
             // use secondaryClusterToBackends, if find be normal
             be = getSecondaryBackend(clusterId);
-            if (be != null && be.isQueryAvailable()) {
+            if (isQueryAvailableAndNotDecommissioning(be)) {
                 return be.getId();
             }
         }
@@ -326,12 +384,46 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
 
         // be abnormal, rehash it. configure settings to different maps
         long pickBeId = hashReplicaToBe(clusterId, false);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("rehash replica backend, clusterId {}, pickedBeId {}, immediateAssign {}, replica info {}, "
+                            + "primaryBackend {}, secondaryBackend {}",
+                    clusterId, pickBeId, Config.enable_immediate_be_assign, this, getPrimaryBackend(clusterId, false),
+                    getSecondaryBackend(clusterId));
+        }
         if (Config.enable_immediate_be_assign) {
             updateClusterToPrimaryBe(clusterId, pickBeId);
         } else {
             updateClusterToSecondaryBe(clusterId, pickBeId);
         }
+        discardRouteIfBackendVanished(pickBeId);
         return pickBeId;
+    }
+
+    /**
+     * The compute group can be dropped while a publisher is picking a backend out of it, in which case the
+     * route just written would outlive the group. Re-checking right after publishing closes that window:
+     * either the backend is already gone and the write is undone here, or it was still registered, which
+     * means the drop -- and the rebalancer sweep it triggers -- happens after this write and will visit
+     * this replica. Ordering, not timing, is what makes the sweep sufficient; a publisher may stall for
+     * arbitrarily long between choosing a backend and publishing without escaping cleanup.
+     *
+     * Every route publisher that resolves a backend outside the rebalancer round must call this, and must
+     * not persist the route when it returns false.
+     *
+     * @return false when the route was discarded because its backend is gone
+     */
+    public boolean discardRouteIfBackendVanished(long beId) {
+        if (!Config.enable_cloud_replica_stale_route_clean) {
+            return true;
+        }
+        // Query-path self-check, not part of the sweep/replay chain: this always runs on whatever thread
+        // is serving the request, never the checkpoint thread, so Env.getCurrentSystemInfo() is correct here.
+        SystemInfoService systemInfo = Env.getCurrentSystemInfo();
+        if (systemInfo.getBackend(beId) == null) {
+            removeInvalidRoutes(systemInfo);
+            return false;
+        }
+        return true;
     }
 
     public Backend getPrimaryBackend(String clusterId, boolean setIfAbsent) {
@@ -345,6 +437,7 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
                 try {
                     beId = getBackendIdImpl(clusterId);
                     updateClusterToPrimaryBe(clusterId, beId);
+                    discardRouteIfBackendVanished(beId);
                     return Env.getCurrentSystemInfo().getBackend(beId);
                 } catch (ComputeGroupException e) {
                     return null;
@@ -384,7 +477,7 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
         List<Backend> decommissionAvailBes = new ArrayList<>();
         for (Backend be : clusterBes) {
             if (be.isQueryAvailable() && !be.isSmoothUpgradeSrc()) {
-                if (be.isDecommissioned()) {
+                if (isDecommissioningOrDecommissioned(be)) {
                     decommissionAvailBes.add(be);
                 } else {
                     availableBes.add(be);
@@ -450,7 +543,7 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
             // be core or restart must in heartbeat_interval_second
             if ((be.isAlive() || missTimeMs <= Config.heartbeat_interval_second * 1000L)
                     && !be.isSmoothUpgradeSrc()) {
-                if (be.isDecommissioned()) {
+                if (isDecommissioningOrDecommissioned(be)) {
                     decommissionAvailBes.add(be);
                 } else {
                     availableBes.add(be);
@@ -515,8 +608,16 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
         return idx;
     }
 
+    private static String shareClusterId(String clusterId) {
+        return SHARED_CLUSTER_IDS.intern(clusterId);
+    }
+
+    private static Long shareBackendId(Long backendId) {
+        return SHARED_BACKEND_IDS.intern(backendId);
+    }
+
     public void updateClusterToPrimaryBe(String cluster, long beId) {
-        primaryClusterToBackend.put(cluster, beId);
+        primaryClusterToBackend.put(shareClusterId(cluster), shareBackendId(beId));
         secondaryClusterToBackends.remove(cluster);
     }
 
@@ -531,12 +632,73 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
             LOG.debug("add to secondary clusterId {}, beId {}, changeTimestamp {}, replica info {}",
                     cluster, beId, changeTimestamp, this);
         }
-        secondaryClusterToBackends.put(cluster, Pair.of(beId, changeTimestamp));
+        secondaryClusterToBackends.put(shareClusterId(cluster), Pair.of(beId, changeTimestamp));
     }
 
     public void clearClusterToBe(String cluster) {
         primaryClusterToBackend.remove(cluster);
         secondaryClusterToBackends.remove(cluster);
+    }
+
+    /**
+     * Drop the route entries whose backend has been dropped from the cluster.
+     *
+     * Such an entry is already dead weight: getBackendIdImpl() resolves the backend id, gets null and
+     * falls back to hashReplicaToBe(), so removing it does not change routing. But nothing ever removes
+     * it either -- removeComputeGroup() only touches CloudSystemInfoService, and the rebalancer only walks the
+     * compute groups that currently exist -- so entries of dropped compute groups pile up forever, both
+     * in FE heap and in the image (the `bes`/`be` field).
+     *
+     * @param systemInfo the backend set to judge staleness against. Callers must pass the SystemInfoService
+     *                    of the same Env whose catalog this replica belongs to (the serving Env during normal
+     *                    replay/rebalancing, or the checkpoint's private Env during image generation) -- never
+     *                    resolve it internally via Env.getCurrentSystemInfo(), since that depends on which
+     *                    thread happens to be calling and would silently judge the wrong Env's replicas.
+     * @return how many entries were dropped
+     */
+    public int removeInvalidRoutes(SystemInfoService systemInfo) {
+        if (!Config.enable_cloud_replica_stale_route_clean || FeConstants.runningUnitTest) {
+            return 0;
+        }
+        // Remove conditionally rather than by predicate: route writers run concurrently, so comparing map
+        // sizes before and after would mix their insertions into the count (and could even report a
+        // negative one), and a key whose value was just rewritten to a live backend must not be dropped.
+        // getBackendByIdWithBoxedId over getBackend: the ids here are already boxed, and this loop runs
+        // per replica, so letting getBackend(long) unbox and rebox them would allocate a Long per route.
+        int removed = 0;
+        if (!secondaryClusterToBackends.isEmpty()) {
+            for (Map.Entry<String, Pair<Long, Long>> entry : secondaryClusterToBackends.entrySet()) {
+                if (systemInfo.getBackendByIdWithBoxedId(entry.getValue().key()) == null
+                        && secondaryClusterToBackends.remove(entry.getKey(), entry.getValue())) {
+                    removed++;
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("removed stale secondary route, clusterId {}, beId {}, replica info {}",
+                                entry.getKey(), entry.getValue().key(), this);
+                    }
+                }
+            }
+        }
+        // Preserve the primary marker for the normal failover state with a live secondary.
+        // Peer discovery enumerates secondaries independently: publication can race with this check.
+        for (Map.Entry<String, Long> entry : primaryClusterToBackend.entrySet()) {
+            if (systemInfo.getBackendByIdWithBoxedId(entry.getValue()) == null
+                    && !secondaryClusterToBackends.containsKey(entry.getKey())
+                    && primaryClusterToBackend.remove(entry.getKey(), entry.getValue())) {
+                removed++;
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("removed stale primary route, clusterId {}, beId {}, replica info {}",
+                            entry.getKey(), entry.getValue(), this);
+                }
+            }
+        }
+        return removed;
+    }
+
+    /**
+     * Returns the set of compute group IDs that have primary backends for this replica.
+     */
+    public Set<String> getPrimaryComputeGroupIds() {
+        return primaryClusterToBackend.keySet();
     }
 
     // ATTN: This func is only used by redundant tablet report clean in bes.
@@ -558,8 +720,53 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
         }
     }
 
+    public List<Backend> getAllSecondaryBes() {
+        List<Backend> result = new ArrayList<>();
+        SystemInfoService systemInfo = Env.getCurrentSystemInfo();
+        for (Pair<Long, Long> route : secondaryClusterToBackends.values()) {
+            Backend backend = systemInfo.getBackendByIdWithBoxedId(route.first);
+            if (backend != null) {
+                result.add(backend);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @param systemInfo the backend set to judge staleness against -- see {@link #removeInvalidRoutes} for why
+     *                    this must come from the caller's Env rather than Env.getCurrentSystemInfo().
+     */
+    public void replayUpdateClusterToPrimaryBe(String clusterId, long beId, SystemInfoService systemInfo) {
+        // A journal queued before backend deletion can arrive after the deletion was replayed.
+        // Do not publish that route, or clear a live secondary while rejecting it.
+        if (Config.enable_cloud_replica_stale_route_clean && !FeConstants.runningUnitTest
+                && systemInfo.getBackend(beId) == null) {
+            return;
+        }
+        updateClusterToPrimaryBe(clusterId, beId);
+    }
+
     public List<Backend> getAllPrimaryBes() {
         List<Backend> result = new ArrayList<Backend>();
+        if (isColocated()) {
+            List<String> clusterIds = ((CloudSystemInfoService) Env.getCurrentSystemInfo()).getCloudClusterIds();
+            for (String clusterId : clusterIds) {
+                try {
+                    long beId = getColocatedBeId(clusterId);
+                    if (beId != -1) {
+                        Backend backend = Env.getCurrentSystemInfo().getBackend(beId);
+                        if (backend != null) {
+                            result.add(backend);
+                        }
+                    }
+                } catch (ComputeGroupException e) {
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("failed to get colocated be for cluster {}, replica {}", clusterId, this, e);
+                    }
+                }
+            }
+            return result;
+        }
         primaryClusterToBackend.forEach((clusterId, beId) -> {
             if (beId != -1) {
                 Backend backend = Env.getCurrentSystemInfo().getBackend(beId);
@@ -585,5 +792,15 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
             }
             this.primaryClusterToBackends = null;
         }
+        // outside the `bes` branch on purpose: the new `be` format accumulates stale entries just the same.
+        // The backends module is loaded before db/recycleBin (PersistMetaModules.MODULE_NAMES), and the
+        // checkpoint thread resolves Env.getCurrentEnv() to its own Env, so the backend set read here is
+        // the one belonging to the image being loaded.
+        removeInvalidRoutes(Env.getCurrentSystemInfo());
+
+        ConcurrentHashMap<String, Long> sharedRoutes = new ConcurrentHashMap<>(primaryClusterToBackend.size());
+        primaryClusterToBackend.forEach((clusterId, backendId) ->
+                sharedRoutes.put(shareClusterId(clusterId), shareBackendId(backendId)));
+        primaryClusterToBackend = sharedRoutes;
     }
 }

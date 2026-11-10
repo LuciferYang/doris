@@ -31,8 +31,7 @@
 #include "core/string_ref.h"
 #include "core/typeid_cast.h"
 #include "core/types.h"
-#include "storage/olap_common.h"
-#include "util/defer_op.h"
+#include "storage/rowset_id.h"
 
 class SipHash;
 
@@ -63,6 +62,11 @@ private:
     ColumnNullable(const ColumnNullable&) = default;
 
 public:
+    struct NullMapState {
+        bool has_null;
+        bool only_null;
+    };
+
     /** Create a column from immutable/shared subcolumns without cloning them.
       * Call IColumn::mutate before modifying the returned column tree.
       */
@@ -157,11 +161,6 @@ public:
         _null_map->insert_from(src_concrete.get_null_map_column(), n);
     }
 
-    void insert_many_fix_len_data(const char* pos, size_t num) override {
-        push_false_to_nullmap(num);
-        get_nested_column().insert_many_fix_len_data(pos, num);
-    }
-
     void insert_many_raw_data(const char* pos, size_t num) override {
         DCHECK(pos);
         push_false_to_nullmap(num);
@@ -213,7 +212,8 @@ public:
 
     size_t filter(const Filter& filter) override;
 
-    Status filter_by_selector(const uint16_t* sel, size_t sel_size, IColumn* col_ptr) override;
+    Status filter_by_selector(const uint16_t* sel, size_t sel_size,
+                              IColumn* col_ptr) const override;
     MutableColumnPtr permute(const Permutation& perm, size_t limit) const override;
     //    ColumnPtr index(const IColumn & indexes, size_t limit) const override;
     int compare_at(size_t n, size_t m, const IColumn& rhs_, int null_direction_hint) const override;
@@ -250,14 +250,14 @@ public:
         return get_ptr();
     }
 
-    void for_each_subcolumn(ColumnCallback callback) override {
-        callback(_nested_column);
+    void mutate_subcolumns() override {
+        mutate_subcolumn(_nested_column);
+        mutate_subcolumn<ColumnUInt8>(_null_map);
+    }
 
-        IColumn::WrappedPtr null_map(std::move(static_cast<ColumnUInt8::Ptr&>(_null_map)));
-        Defer defer([&] {
-            _null_map = cast_to_column<ColumnUInt8>(static_cast<const IColumn::Ptr&>(null_map));
-        });
-        callback(null_map);
+    void for_each_subcolumn(ColumnCallback callback) const override {
+        callback(*static_cast<const IColumn::Ptr&>(_nested_column));
+        callback(*static_cast<const ColumnUInt8::Ptr&>(_null_map));
     }
 
     bool structure_equals(const IColumn& rhs) const override {
@@ -275,7 +275,10 @@ public:
                get_null_map_column().is_exclusive();
     }
 
+    bool try_replace_null_payload_with_default_without_cow() const override;
+
     bool only_null() const override;
+    NullMapState get_null_map_state() const;
 
     // used in schema change
     void change_nested_column(ColumnPtr& other) { ((ColumnPtr&)_nested_column) = other; }
@@ -419,4 +422,8 @@ private:
 
 ColumnPtr make_nullable(const ColumnPtr& column, bool is_nullable = false);
 ColumnPtr remove_nullable(const ColumnPtr& column);
+
+// Return the nested column if nullable, otherwise the column itself.
+// Set null_map to the flags at row_pos, or nullptr for a non-nullable column.
+const IColumn& peel_nullable(const IColumn& column, size_t row_pos, const uint8_t** null_map);
 } // namespace doris

@@ -33,8 +33,7 @@ suite("test_olap_table_stream_history_consumption") {
         DISTRIBUTED BY HASH(`sid`) BUCKETS 1
         PROPERTIES (
         "replication_allocation" = "tag.location.default: 1",
-        "binlog.enable" = "true",
-        "binlog.format" = "ROW"
+        "changelog.enable" = "true"
         ); 
     """
     sql """ 
@@ -65,8 +64,7 @@ suite("test_olap_table_stream_history_consumption") {
         DISTRIBUTED BY HASH(`sname`) BUCKETS 1
         PROPERTIES (
         "replication_allocation" = "tag.location.default: 1",
-        "binlog.enable" = "true",
-        "binlog.format" = "ROW"
+        "changelog.enable" = "true"
         ); 
     """
 
@@ -99,8 +97,7 @@ suite("test_olap_table_stream_history_consumption") {
         DISTRIBUTED BY HASH(`sname`) BUCKETS 1
         PROPERTIES (
         "replication_allocation" = "tag.location.default: 1",
-        "binlog.enable" = "true",
-        "binlog.format" = "ROW"
+        "changelog.enable" = "true"
         ); 
     """
 
@@ -117,10 +114,6 @@ suite("test_olap_table_stream_history_consumption") {
     """
 
     qt_sql "select DB_NAME,STREAM_NAME,UNIT,CONSUMPTION_STATUS,LAG,LAST_CONSUMPTION_TIME from information_schema.table_stream_consumption where DB_NAME = 'test_olap_table_stream_history_consumption_db' order by STREAM_NAME, UNIT;"
-    qt_sql "select * from s1"
-    qt_sql "select * from s2"
-    qt_sql "select * from s3"
-    sql "SET show_hidden_columns=true;"
     qt_sql "select * from s1"
     qt_sql "select * from s2"
     qt_sql "select * from s3"

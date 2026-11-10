@@ -41,6 +41,19 @@
 #include "util/uid_util.h"
 
 namespace doris {
+VDataStreamRecvr::SenderQueue::BlockItem::BlockItem() = default;
+
+VDataStreamRecvr::SenderQueue::BlockItem::BlockItem(BlockUPtr&& block, size_t block_byte_size)
+        : _block(std::move(block)), _block_byte_size(block_byte_size) {}
+
+VDataStreamRecvr::SenderQueue::BlockItem::BlockItem(std::unique_ptr<PBlock>&& pblock,
+                                                    size_t block_byte_size)
+        : _block(nullptr), _pblock(std::move(pblock)), _block_byte_size(block_byte_size) {}
+
+VDataStreamRecvr::SenderQueue::BlockItem::BlockItem(BlockItem&&) noexcept = default;
+VDataStreamRecvr::SenderQueue::BlockItem& VDataStreamRecvr::SenderQueue::BlockItem::operator=(
+        BlockItem&&) noexcept = default;
+VDataStreamRecvr::SenderQueue::BlockItem::~BlockItem() = default;
 
 VDataStreamRecvr::SenderQueue::SenderQueue(VDataStreamRecvr* parent_recvr, int num_senders,
                                            std::shared_ptr<Dependency> local_channel_dependency)
@@ -90,27 +103,37 @@ Status VDataStreamRecvr::SenderQueue::get_batch(Block* block, bool* eos) {
         block_item = std::move(_block_queue.front());
         _block_queue.pop_front();
     }
+
+    size_t block_byte_size = block_item.block_byte_size();
+    Defer release_block {[&]() {
+        COUNTER_UPDATE(_recvr->_deserialize_row_batch_timer, block_item.deserialize_time());
+        COUNTER_UPDATE(_recvr->_decompress_timer, block_item.decompress_time());
+        COUNTER_UPDATE(_recvr->_decompress_bytes, block_item.decompress_bytes());
+        _recvr->_memory_used_counter->update(-(int64_t)block_byte_size);
+        {
+            INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
+            sub_blocks_memory_usage(block_byte_size);
+            if (_block_queue.empty() && _source_dependency) {
+                if (!_is_cancelled && _num_remaining_senders > 0) {
+                    _source_dependency->block();
+                }
+            }
+        }
+        block_item.call_done(_recvr);
+    }};
+
     BlockUPtr next_block;
     RETURN_IF_ERROR(block_item.get_block(next_block));
-    size_t block_byte_size = block_item.block_byte_size();
-    COUNTER_UPDATE(_recvr->_deserialize_row_batch_timer, block_item.deserialize_time());
-    COUNTER_UPDATE(_recvr->_decompress_timer, block_item.decompress_time());
-    COUNTER_UPDATE(_recvr->_decompress_bytes, block_item.decompress_bytes());
-    _recvr->_memory_used_counter->update(-(int64_t)block_byte_size);
-    INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
-    sub_blocks_memory_usage(block_byte_size);
-    if (_block_queue.empty() && _source_dependency) {
-        if (!_is_cancelled && _num_remaining_senders > 0) {
-            _source_dependency->block();
-        }
-    }
-
-    block_item.call_done(_recvr);
 
     DCHECK(block->empty());
     block->swap(*next_block);
     *eos = false;
     return Status::OK();
+}
+
+bool VDataStreamRecvr::SenderQueue::has_data_or_finished() {
+    std::lock_guard<std::mutex> l(_lock);
+    return _is_cancelled || !_block_queue.empty() || _num_remaining_senders == 0;
 }
 
 void VDataStreamRecvr::SenderQueue::set_source_ready(std::lock_guard<std::mutex>&) {
@@ -431,16 +454,21 @@ Status VDataStreamRecvr::create_merger(const VExprContextSPtrs& ordering_expr,
     DCHECK(_is_merging);
     SCOPED_CONSUME_MEM_TRACKER(_mem_tracker.get());
     std::vector<BlockSupplier> child_block_suppliers;
+    std::vector<BlockSupplierReadyChecker> child_block_supplier_ready_checkers;
     // Create the merger that will a single stream of sorted rows.
     _merger.reset(new VSortedRunMerger(ordering_expr, is_asc_order, nulls_first, batch_size, limit,
                                        offset, _profile));
 
+    child_block_suppliers.reserve(_sender_queues.size());
+    child_block_supplier_ready_checkers.reserve(_sender_queues.size());
     for (int i = 0; i < _sender_queues.size(); ++i) {
         child_block_suppliers.emplace_back(std::bind(std::mem_fn(&SenderQueue::get_batch),
                                                      _sender_queues[i], std::placeholders::_1,
                                                      std::placeholders::_2));
+        child_block_supplier_ready_checkers.emplace_back(
+                std::bind(std::mem_fn(&SenderQueue::has_data_or_finished), _sender_queues[i]));
     }
-    RETURN_IF_ERROR(_merger->prepare(child_block_suppliers));
+    RETURN_IF_ERROR(_merger->prepare(child_block_suppliers, child_block_supplier_ready_checkers));
     return Status::OK();
 }
 

@@ -16,6 +16,7 @@
 // under the License.
 
 #pragma once
+#include <functional>
 #include <string>
 
 #include "common/object_pool.h"
@@ -24,7 +25,6 @@
 #include "core/data_type/data_type.h"
 #include "core/data_type/define_primitive_type.h"
 #include "exprs/aggregate/aggregate_function.h"
-#include "exprs/function/function.h"
 #include "exprs/function_context.h"
 #include "exprs/vexpr.h"
 
@@ -44,7 +44,8 @@ public:
 #ifdef BE_TEST
     VCastExpr() = default;
 #endif
-    VCastExpr(const TExprNode& node) : VExpr(node) {}
+    VCastExpr(const TExprNode& node)
+            : VExpr(node), _is_strict_cast(node.__isset.is_strict_cast && node.is_strict_cast) {}
     ~VCastExpr() override = default;
     Status execute_column_impl(VExprContext* context, const Block* block, const Selector* selector,
                                size_t count, ColumnPtr& result_column) const override;
@@ -55,29 +56,41 @@ public:
     const std::string& expr_name() const override;
     std::string debug_string() const override;
     const DataTypePtr& get_target_type() const;
+    bool is_safe_to_execute_on_selected_rows() const override { return false; }
 
     virtual std::string cast_name() const { return "CAST"; }
+    Status clone_node(VExprSPtr* cloned_expr) const override {
+        DORIS_CHECK(cloned_expr != nullptr);
+        *cloned_expr = VCastExpr::create_shared(clone_texpr_node());
+        return Status::OK();
+    }
 
     uint64_t get_digest(uint64_t seed) const override {
         auto res = VExpr::get_digest(seed);
         if (res) {
-            return HashUtil::hash64(_target_data_type_name.data(), _target_data_type_name.size(),
-                                    res);
+            res = HashUtil::hash64(_target_data_type_name.data(), _target_data_type_name.size(),
+                                   res);
+            return HashUtil::hash64(&_is_strict_cast, sizeof(_is_strict_cast), res);
         }
         return 0;
     }
 
 protected:
-    FunctionBasePtr _function;
+    using CastExecutor =
+            std::function<Status(RuntimeState*, const ColumnWithTypeAndName&,
+                                 ColumnWithTypeAndName&, size_t, const NullMap::value_type*)>;
+    Status execute_cast(RuntimeState* state, const ColumnWithTypeAndName& source,
+                        const DataTypePtr& result_type, size_t rows,
+                        ColumnPtr& result_column) const;
+    CastExecutor _cast_executor;
     std::string _expr_name;
+    RuntimeState* _runtime_state = nullptr;
 
 private:
     DataTypePtr _target_data_type;
     std::string _target_data_type_name;
 
-    DataTypePtr _cast_param_data_type;
-
-    static const constexpr char* function_name = "CAST";
+    bool _is_strict_cast = false;
 };
 
 class TryCastExpr final : public VCastExpr {
@@ -94,10 +107,19 @@ public:
                                size_t count, ColumnPtr& result_column) const override;
     ~TryCastExpr() override = default;
     std::string cast_name() const override { return "TRY CAST"; }
+    bool is_safe_to_execute_on_selected_rows() const override {
+        return VExpr::is_safe_to_execute_on_selected_rows();
+    }
+    Status clone_node(VExprSPtr* cloned_expr) const override {
+        DORIS_CHECK(cloned_expr != nullptr);
+        auto node = clone_texpr_node();
+        node.__set_is_cast_nullable(_original_cast_return_is_nullable);
+        *cloned_expr = TryCastExpr::create_shared(node);
+        return Status::OK();
+    }
 
 private:
     DataTypePtr original_cast_return_type() const;
-    template <bool original_cast_reutrn_is_nullable>
     Status single_row_execute(VExprContext* context, const ColumnWithTypeAndName& input_info,
                               ColumnPtr& return_column) const;
 

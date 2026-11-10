@@ -92,6 +92,7 @@ private:
 
     bool reserve_lru_log_queue_slot(FileCacheType type);
     void release_lru_log_queue_slot(FileCacheType type);
+    void limit_shadow_queue_size(LRUQueue& shadow_queue, std::lock_guard<std::mutex>& lru_log_lock);
 };
 
 } // namespace doris::io

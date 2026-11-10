@@ -38,6 +38,7 @@
 #include "io/fs/path.h"
 #include "io/fs/s3_file_reader.h"
 #include "io/io_common.h"
+#include "runtime/file_scan_profile.h"
 #include "runtime/runtime_profile.h"
 #include "storage/olap_define.h"
 #include "util/slice.h"
@@ -179,6 +180,7 @@ private:
     bool _closed = false;
 
     RuntimeProfile::Counter* _request_io = nullptr;
+    RuntimeProfile::Counter* _total_time = nullptr;
     RuntimeProfile::Counter* _request_bytes = nullptr;
     RuntimeProfile::Counter* _request_time = nullptr;
     RuntimeProfile::Counter* _read_to_cache_time = nullptr;
@@ -301,7 +303,9 @@ public:
 
         if (_profile != nullptr) {
             const char* random_profile = "MergedSmallIO";
-            ADD_TIMER_WITH_LEVEL(_profile, random_profile, 1);
+            _total_time = ADD_CHILD_TIMER_WITH_LEVEL(
+                    _profile, random_profile,
+                    file_scan_profile::parent_or_root(_profile, file_scan_profile::IO), 1);
             _copy_time = ADD_CHILD_TIMER_WITH_LEVEL(_profile, "CopyTime", random_profile, 1);
             _read_time = ADD_CHILD_TIMER_WITH_LEVEL(_profile, "ReadTime", random_profile, 1);
             _request_io = ADD_CHILD_COUNTER_WITH_LEVEL(_profile, "RequestIO", TUnit::UNIT,
@@ -350,6 +354,7 @@ protected:
 
     void _collect_profile_before_close() override {
         if (_profile != nullptr) {
+            COUNTER_UPDATE(_total_time, _statistics.copy_time + _statistics.read_time);
             COUNTER_UPDATE(_copy_time, _statistics.copy_time);
             COUNTER_UPDATE(_read_time, _statistics.read_time);
             COUNTER_UPDATE(_request_io, _statistics.request_io);
@@ -363,6 +368,7 @@ protected:
     }
 
 private:
+    RuntimeProfile::Counter* _total_time = nullptr;
     RuntimeProfile::Counter* _copy_time = nullptr;
     RuntimeProfile::Counter* _read_time = nullptr;
     RuntimeProfile::Counter* _request_io = nullptr;
@@ -463,6 +469,11 @@ struct PrefetchBuffer : std::enable_shared_from_this<PrefetchBuffer>, public Pro
     io::FileReaderSPtr _reader;
     std::shared_ptr<const IOContext> _io_ctx_holder;
     const IOContext* _io_ctx = nullptr;
+    // Only the worker writes these statistics. The consumer merges them after observing
+    // completion under _lock, before reusing or closing the buffer.
+    IOContext _prefetch_io_ctx;
+    FileCacheStatistics _file_cache_stats;
+    bool _has_unmerged_cache_stats = false;
     PODArray<char> _buf;
     BufferStatus _buffer_status {BufferStatus::RESET};
     std::mutex _lock;
@@ -509,6 +520,9 @@ struct PrefetchBuffer : std::enable_shared_from_this<PrefetchBuffer>, public Pro
     void _collect_profile_at_runtime() override {}
 
     void _collect_profile_before_close() override;
+
+private:
+    void _merge_file_cache_stats();
 };
 
 constexpr int64_t s_max_pre_buffer_size = 4 * 1024 * 1024; // 4MB

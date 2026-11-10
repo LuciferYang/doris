@@ -253,6 +253,87 @@ TEST_F(DataTypeDecimalTest, ctor) {
     EXPECT_THROW(DataTypeDecimalV2(27, 9, 27, 28), Exception);
     EXPECT_THROW(DataTypeDecimalV2(27, 9, 26, 27), Exception);
 }
+
+TEST_F(DataTypeDecimalTest, decimalv2_constructor_normalizes_execution_parameters) {
+    auto check_type = [](const DataTypeDecimalV2& type, UInt32 original_precision,
+                         UInt32 original_scale) {
+        EXPECT_EQ(type.get_precision(), 27);
+        EXPECT_EQ(type.get_scale(), 9);
+        EXPECT_EQ(type.get_original_precision(), original_precision);
+        EXPECT_EQ(type.get_original_scale(), original_scale);
+        EXPECT_EQ(type.get_format_scale(), original_scale);
+        auto column = type.create_column();
+        EXPECT_EQ(assert_cast<const ColumnDecimal128V2&>(*column).get_scale(), 9);
+        DataTypeDecimalV2 copy(type);
+        EXPECT_EQ(copy.get_precision(), 27);
+        EXPECT_EQ(copy.get_scale(), 9);
+        EXPECT_EQ(copy.get_original_precision(), original_precision);
+        EXPECT_EQ(copy.get_original_scale(), original_scale);
+    };
+    check_type(DataTypeDecimalV2(), 27, 9);
+    check_type(DataTypeDecimalV2(18, 2), 18, 2);
+    check_type(DataTypeDecimalV2(1, 0), 1, 0);
+    check_type(DataTypeDecimalV2(27, 9, 18, 2), 18, 2);
+    check_type(DataTypeDecimalV2(18, 2, 12, 4), 12, 4);
+    check_type(DataTypeDecimalV2(27, 9, UINT32_MAX, UINT32_MAX), 27, 9);
+    check_type(DataTypeDecimalV2(18, 2, UINT32_MAX, UINT32_MAX), 18, 2);
+    auto type = create_decimal(18, 2, true);
+    check_type(assert_cast<const DataTypeDecimalV2&>(*type), 18, 2);
+    EXPECT_THROW(DataTypeDecimalV2(0, 0, 18, 2), Exception);
+    EXPECT_THROW(DataTypeDecimalV2(28, 9, 18, 2), Exception);
+    EXPECT_THROW(DataTypeDecimalV2(27, 28, 18, 2), Exception);
+    EXPECT_THROW(DataTypeDecimalV2(1, 2, 18, 2), Exception);
+}
+
+TEST_F(DataTypeDecimalTest, decimalv2_preserves_format_and_column_metadata) {
+    DataTypeDecimalV2 type(18, 2);
+    DecimalV2Value value;
+    ASSERT_EQ(value.parse_from_str("123.45", 6), E_DEC_OK);
+    EXPECT_EQ(type.to_string(value), "123.45");
+
+    PColumnMeta meta;
+    type.to_pb_column_meta(&meta);
+    EXPECT_EQ(meta.decimal_param().precision(), 18);
+    EXPECT_EQ(meta.decimal_param().scale(), 2);
+    auto restored = DataTypeFactory::instance().create_data_type(meta);
+    const auto& decimal = assert_cast<const DataTypeDecimalV2&>(*restored);
+    EXPECT_EQ(decimal.get_precision(), 27);
+    EXPECT_EQ(decimal.get_scale(), 9);
+    EXPECT_EQ(decimal.get_original_precision(), 18);
+    EXPECT_EQ(decimal.get_original_scale(), 2);
+    EXPECT_EQ(decimal.to_string(value), "123.45");
+}
+
+TEST_F(DataTypeDecimalTest, decimalv2_nested_types_preserve_schema_metadata) {
+    auto decimal = std::make_shared<DataTypeDecimalV2>(18, 2);
+    auto array = std::make_shared<DataTypeArray>(decimal);
+    auto map = std::make_shared<DataTypeMap>(std::make_shared<DataTypeInt32>(), decimal);
+    auto structure = std::make_shared<DataTypeStruct>(
+            DataTypes {array, map, make_nullable(decimal)}, Strings {"items", "mapping", "amount"});
+    auto nested = make_nullable(structure);
+    PColumnMeta meta;
+    nested->to_pb_column_meta(&meta);
+    auto restored = DataTypeFactory::instance().create_data_type(meta);
+    ASSERT_TRUE(restored->is_nullable());
+    EXPECT_TRUE(nested->equals(*restored));
+    const auto& restored_struct = assert_cast<const DataTypeStruct&>(*remove_nullable(restored));
+    EXPECT_EQ(restored_struct.get_element_name(0), "items");
+    EXPECT_EQ(restored_struct.get_element_name(1), "mapping");
+    EXPECT_EQ(restored_struct.get_element_name(2), "amount");
+    const auto& restored_array = assert_cast<const DataTypeArray&>(*restored_struct.get_element(0));
+    const auto& restored_map = assert_cast<const DataTypeMap&>(*restored_struct.get_element(1));
+    ASSERT_TRUE(restored_array.get_nested_type()->is_nullable());
+    ASSERT_TRUE(restored_struct.get_element(2)->is_nullable());
+    for (const auto& child : {restored_array.get_nested_type(), restored_map.get_value_type(),
+                              restored_struct.get_element(2)}) {
+        const auto& type = assert_cast<const DataTypeDecimalV2&>(*remove_nullable(child));
+        EXPECT_EQ(type.get_precision(), 27);
+        EXPECT_EQ(type.get_scale(), 9);
+        EXPECT_EQ(type.get_original_precision(), 18);
+        EXPECT_EQ(type.get_original_scale(), 2);
+    }
+}
+
 TEST_F(DataTypeDecimalTest, simple_func_test) {
     auto test_func = [](auto& dt) {
         using DataType = decltype(dt);
@@ -453,176 +534,6 @@ TEST_F(DataTypeDecimalTest, ser_deser) {
     test_func(dt_decimal256_1, *column_decimal256_1, BeExecVersionManager::max_be_exec_version);
     test_func(dt_decimal256_2, *column_decimal256_2, BeExecVersionManager::max_be_exec_version);
     test_func(dt_decimal256_3, *column_decimal256_3, BeExecVersionManager::max_be_exec_version);
-}
-// Regression for legacy DecimalV2 segments written by Doris < 2.1.0 (before
-// #26572): ColumnMetaPB.precision/frac are absent and default to 0 when read
-// back. DataTypeFactory must not pass 0 as the original precision/scale to
-// DataTypeDecimalV2, otherwise check_type_precision throws
-// "meet invalid precision: real_precision=0".
-TEST_F(DataTypeDecimalTest, create_decimalv2_from_legacy_tablet_column) {
-    // Case 1: legacy segment — precision/frac missing (default 0)
-    {
-        TabletColumn col;
-        col.set_type(FieldType::OLAP_FIELD_TYPE_DECIMAL);
-        // intentionally do not set precision/frac to mimic old segments
-        DataTypePtr dt;
-        EXPECT_NO_THROW(dt = DataTypeFactory::instance().create_data_type(col, false));
-        ASSERT_NE(dt, nullptr);
-        EXPECT_EQ(dt->get_primitive_type(), TYPE_DECIMALV2);
-        const auto* decv2 = assert_cast<const DataTypeDecimalV2*>(dt.get());
-        EXPECT_EQ(decv2->get_precision(), BeConsts::MAX_DECIMALV2_PRECISION);
-        EXPECT_EQ(decv2->get_scale(), BeConsts::MAX_DECIMALV2_SCALE);
-        // When original precision/scale are unknown, get_original_* should fall
-        // back to the in-memory (27, 9) representation.
-        EXPECT_EQ(decv2->get_original_precision(), BeConsts::MAX_DECIMALV2_PRECISION);
-        EXPECT_EQ(decv2->get_original_scale(), BeConsts::MAX_DECIMALV2_SCALE);
-    }
-    // Case 2: new segment — precision/frac are persisted (e.g. decimal(26,6))
-    {
-        TabletColumn col;
-        col.set_type(FieldType::OLAP_FIELD_TYPE_DECIMAL);
-        col.set_precision(26);
-        col.set_frac(6);
-        DataTypePtr dt;
-        EXPECT_NO_THROW(dt = DataTypeFactory::instance().create_data_type(col, false));
-        ASSERT_NE(dt, nullptr);
-        EXPECT_EQ(dt->get_primitive_type(), TYPE_DECIMALV2);
-        const auto* decv2 = assert_cast<const DataTypeDecimalV2*>(dt.get());
-        EXPECT_EQ(decv2->get_precision(), BeConsts::MAX_DECIMALV2_PRECISION);
-        EXPECT_EQ(decv2->get_scale(), BeConsts::MAX_DECIMALV2_SCALE);
-        EXPECT_EQ(decv2->get_original_precision(), 26U);
-        EXPECT_EQ(decv2->get_original_scale(), 6U);
-    }
-    // Case 3: same regression via the segment-read path that consumes
-    // ColumnMetaPB directly (this is the exact code path that broke after
-    // PR #35222 when reading old DecimalV2 segments).
-    {
-        segment_v2::ColumnMetaPB meta;
-        meta.set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_DECIMAL));
-        // precision/frac intentionally unset -> default 0
-        DataTypePtr dt;
-        EXPECT_NO_THROW(dt = DataTypeFactory::instance().create_data_type(meta));
-        ASSERT_NE(dt, nullptr);
-        EXPECT_EQ(dt->get_primitive_type(), TYPE_DECIMALV2);
-        const auto* decv2 = assert_cast<const DataTypeDecimalV2*>(dt.get());
-        EXPECT_EQ(decv2->get_precision(), BeConsts::MAX_DECIMALV2_PRECISION);
-        EXPECT_EQ(decv2->get_scale(), BeConsts::MAX_DECIMALV2_SCALE);
-        EXPECT_EQ(decv2->get_original_precision(), BeConsts::MAX_DECIMALV2_PRECISION);
-        EXPECT_EQ(decv2->get_original_scale(), BeConsts::MAX_DECIMALV2_SCALE);
-    }
-}
-
-// Regression for complex types wrapping legacy DecimalV2 children whose
-// segment ColumnMetaPB.precision/frac default to 0. The fix in
-// DataTypeFactory::create_data_type(segment_v2::ColumnMetaPB&) must
-// propagate through Array / Map / Struct / AggState recursively.
-TEST_F(DataTypeDecimalTest, create_complex_types_with_legacy_decimalv2) {
-    auto make_legacy_decv2_meta = []() {
-        segment_v2::ColumnMetaPB child;
-        child.set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_DECIMAL));
-        // precision/frac intentionally unset -> default 0
-        return child;
-    };
-    auto unwrap_nullable = [](const DataTypePtr& dt) -> DataTypePtr {
-        if (dt && dt->is_nullable()) {
-            return assert_cast<const DataTypeNullable*>(dt.get())->get_nested_type();
-        }
-        return dt;
-    };
-
-    // Array<DecimalV2>
-    {
-        segment_v2::ColumnMetaPB meta;
-        meta.set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_ARRAY));
-        *meta.add_children_columns() = make_legacy_decv2_meta();
-        DataTypePtr dt;
-        EXPECT_NO_THROW(dt = DataTypeFactory::instance().create_data_type(meta));
-        ASSERT_NE(dt, nullptr);
-        EXPECT_EQ(dt->get_primitive_type(), TYPE_ARRAY);
-        const auto* arr = assert_cast<const DataTypeArray*>(dt.get());
-        auto elem = unwrap_nullable(arr->get_nested_type());
-        EXPECT_EQ(elem->get_primitive_type(), TYPE_DECIMALV2);
-        const auto* decv2 = assert_cast<const DataTypeDecimalV2*>(elem.get());
-        EXPECT_EQ(decv2->get_original_precision(), BeConsts::MAX_DECIMALV2_PRECISION);
-        EXPECT_EQ(decv2->get_original_scale(), BeConsts::MAX_DECIMALV2_SCALE);
-    }
-
-    // Map<Int, DecimalV2>
-    {
-        segment_v2::ColumnMetaPB meta;
-        meta.set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_MAP));
-        auto* k = meta.add_children_columns();
-        k->set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_INT));
-        *meta.add_children_columns() = make_legacy_decv2_meta();
-        DataTypePtr dt;
-        EXPECT_NO_THROW(dt = DataTypeFactory::instance().create_data_type(meta));
-        ASSERT_NE(dt, nullptr);
-        EXPECT_EQ(dt->get_primitive_type(), TYPE_MAP);
-        const auto* m = assert_cast<const DataTypeMap*>(dt.get());
-        EXPECT_EQ(unwrap_nullable(m->get_key_type())->get_primitive_type(), TYPE_INT);
-        auto v = unwrap_nullable(m->get_value_type());
-        EXPECT_EQ(v->get_primitive_type(), TYPE_DECIMALV2);
-        const auto* decv2 = assert_cast<const DataTypeDecimalV2*>(v.get());
-        EXPECT_EQ(decv2->get_original_precision(), BeConsts::MAX_DECIMALV2_PRECISION);
-    }
-
-    // Struct<DecimalV2, Int>
-    {
-        segment_v2::ColumnMetaPB meta;
-        meta.set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_STRUCT));
-        *meta.add_children_columns() = make_legacy_decv2_meta();
-        auto* second = meta.add_children_columns();
-        second->set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_INT));
-        DataTypePtr dt;
-        EXPECT_NO_THROW(dt = DataTypeFactory::instance().create_data_type(meta));
-        ASSERT_NE(dt, nullptr);
-        EXPECT_EQ(dt->get_primitive_type(), TYPE_STRUCT);
-        const auto* s = assert_cast<const DataTypeStruct*>(dt.get());
-        ASSERT_EQ(s->get_elements().size(), 2u);
-        EXPECT_EQ(unwrap_nullable(s->get_element(0))->get_primitive_type(), TYPE_DECIMALV2);
-        EXPECT_EQ(unwrap_nullable(s->get_element(1))->get_primitive_type(), TYPE_INT);
-    }
-
-    // Nested: Array<Map<Int, DecimalV2>>
-    {
-        segment_v2::ColumnMetaPB meta;
-        meta.set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_ARRAY));
-        auto* map_child = meta.add_children_columns();
-        map_child->set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_MAP));
-        auto* k = map_child->add_children_columns();
-        k->set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_INT));
-        *map_child->add_children_columns() = make_legacy_decv2_meta();
-        DataTypePtr dt;
-        EXPECT_NO_THROW(dt = DataTypeFactory::instance().create_data_type(meta));
-        ASSERT_NE(dt, nullptr);
-        EXPECT_EQ(dt->get_primitive_type(), TYPE_ARRAY);
-        auto inner =
-                unwrap_nullable(assert_cast<const DataTypeArray*>(dt.get())->get_nested_type());
-        EXPECT_EQ(inner->get_primitive_type(), TYPE_MAP);
-        auto v = unwrap_nullable(assert_cast<const DataTypeMap*>(inner.get())->get_value_type());
-        EXPECT_EQ(v->get_primitive_type(), TYPE_DECIMALV2);
-    }
-
-    // AggState (count) with legacy DecimalV2 sub-type
-    {
-        segment_v2::ColumnMetaPB meta;
-        meta.set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_AGG_STATE));
-        meta.set_function_name("count");
-        meta.set_result_is_nullable(false);
-        meta.set_be_exec_version(BeExecVersionManager::get_newest_version());
-        *meta.add_children_columns() = make_legacy_decv2_meta();
-        DataTypePtr dt;
-        EXPECT_NO_THROW(dt = DataTypeFactory::instance().create_data_type(meta));
-        ASSERT_NE(dt, nullptr);
-        EXPECT_EQ(dt->get_primitive_type(), TYPE_AGG_STATE);
-        const auto* agg = assert_cast<const DataTypeAggState*>(dt.get());
-        ASSERT_EQ(agg->get_sub_types().size(), 1u);
-        auto sub = unwrap_nullable(agg->get_sub_types()[0]);
-        EXPECT_EQ(sub->get_primitive_type(), TYPE_DECIMALV2);
-        const auto* decv2 = assert_cast<const DataTypeDecimalV2*>(sub.get());
-        EXPECT_EQ(decv2->get_original_precision(), BeConsts::MAX_DECIMALV2_PRECISION);
-        EXPECT_EQ(decv2->get_original_scale(), BeConsts::MAX_DECIMALV2_SCALE);
-    }
 }
 
 TEST_F(DataTypeDecimalTest, to_pb_column_meta) {

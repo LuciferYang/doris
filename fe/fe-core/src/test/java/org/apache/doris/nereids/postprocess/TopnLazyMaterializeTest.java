@@ -24,6 +24,8 @@ import org.apache.doris.nereids.datasets.ssb.SSBTestBase;
 import org.apache.doris.nereids.glue.translator.PhysicalPlanTranslator;
 import org.apache.doris.nereids.glue.translator.PlanTranslatorContext;
 import org.apache.doris.nereids.processor.post.PlanPostProcessors;
+import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalLazyMaterialize;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
 import org.apache.doris.nereids.util.PlanChecker;
 import org.apache.doris.planner.MaterializationNode;
@@ -115,6 +117,185 @@ public class TopnLazyMaterializeTest extends SSBTestBase {
                 .orElseThrow(() -> new AssertionError("lazy user_profile slot not found"));
         Assertions.assertTrue(userProfileSlot.getAllAccessPaths().contains(
                 ColumnAccessPath.data(ImmutableList.of("user_profile", "professional", "skills"))));
+    }
+
+    @Test
+    public void testLazyBaseColumnIndexUsesOriginalColumnNameForAlias() throws Exception {
+        this.createTable("create table lazy_materialize_alias_tbl("
+                + "sort_col int, lazy_col int) "
+                + "duplicate key(sort_col) distributed by hash(sort_col) buckets 1 "
+                + "properties('replication_num' = '1')");
+        String sql = "select lazy_col as lazy_alias from lazy_materialize_alias_tbl "
+                + "order by sort_col limit 1";
+
+        PlanChecker checker = PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .implement();
+        PhysicalPlan plan = checker.getPhysicalPlan();
+        plan = new PlanPostProcessors(checker.getCascadesContext()).process(plan);
+
+        List<PhysicalLazyMaterialize<? extends Plan>> materializeNodes = plan.collectToList(
+                node -> node instanceof PhysicalLazyMaterialize);
+        Assertions.assertEquals(1, materializeNodes.size(), plan.treeString());
+        Assertions.assertEquals(ImmutableList.of(ImmutableList.of(1)),
+                materializeNodes.get(0).getLazyBaseColumnIndices());
+    }
+
+    @Test
+    public void testOrderByAliasKeepsItsSourceMaterialized() throws Exception {
+        this.createTable("create table lazy_materialize_order_by_alias_tbl("
+                + "sort_col int, lazy_col int, other_col int) "
+                + "duplicate key(sort_col) distributed by hash(sort_col) buckets 1 "
+                + "properties('replication_num' = '1')");
+        // TestWithFeService enables feDebug, which makes LazyMaterializeTopN validate its own result and
+        // silently fall back on an invalid plan. Turn it off so an invalid plan fails the whole test.
+        boolean feDebug = connectContext.getSessionVariable().feDebug;
+        connectContext.getSessionVariable().feDebug = false;
+        try {
+            // The TopN sorts by an alias of lazy_col, so lazy_col must be materialized for the sort.
+            // Otherwise LazySlotPruning removes it from the scan while `lazy_col AS x` below the TopN
+            // still reads it, and the resulting plan references a slot its child no longer produces.
+            PhysicalPlan plan = postProcess("select lazy_col as x, lazy_col as y "
+                    + "from lazy_materialize_order_by_alias_tbl order by x limit 1");
+            Assertions.assertTrue(
+                    plan.collectToList(node -> node instanceof PhysicalLazyMaterialize).isEmpty(),
+                    plan.treeString());
+
+            // Sorting by a bare column that is also aliased must keep that column materialized.
+            plan = postProcess("select lazy_col, lazy_col as y "
+                    + "from lazy_materialize_order_by_alias_tbl order by lazy_col limit 1");
+            Assertions.assertTrue(
+                    plan.collectToList(node -> node instanceof PhysicalLazyMaterialize).isEmpty(),
+                    plan.treeString());
+
+            // Only the column the order key reads is forced materialized, other_col is still fetched lazily.
+            plan = postProcess("select lazy_col as x, other_col as y "
+                    + "from lazy_materialize_order_by_alias_tbl order by x limit 1");
+            List<PhysicalLazyMaterialize<? extends Plan>> materializeNodes = plan.collectToList(
+                    node -> node instanceof PhysicalLazyMaterialize);
+            Assertions.assertEquals(1, materializeNodes.size(), plan.treeString());
+            Assertions.assertEquals(ImmutableList.of(ImmutableList.of(2)),
+                    materializeNodes.get(0).getLazyBaseColumnIndices());
+
+            // Sorting by a column that is not aliased keeps every projected column lazily fetched.
+            plan = postProcess("select lazy_col as x, other_col as y "
+                    + "from lazy_materialize_order_by_alias_tbl order by sort_col limit 1");
+            materializeNodes = plan.collectToList(node -> node instanceof PhysicalLazyMaterialize);
+            Assertions.assertEquals(1, materializeNodes.size(), plan.treeString());
+            List<Integer> lazyColumnIndexes = Lists.newArrayList();
+            materializeNodes.get(0).getLazyBaseColumnIndices().forEach(lazyColumnIndexes::addAll);
+            lazyColumnIndexes.sort(Integer::compareTo);
+            Assertions.assertEquals(ImmutableList.of(1, 2), lazyColumnIndexes);
+        } finally {
+            connectContext.getSessionVariable().feDebug = feDebug;
+        }
+    }
+
+    @Test
+    public void testNestedTopNKeepsAliasSourceMaterialized() throws Exception {
+        this.createTable("create table lazy_materialize_nested_topn_tbl("
+                + "sort_col int, lazy_col int, other_col int) "
+                + "duplicate key(sort_col) distributed by hash(sort_col) buckets 1 "
+                + "properties('replication_num' = '1')");
+        boolean feDebug = connectContext.getSessionVariable().feDebug;
+        connectContext.getSessionVariable().feDebug = false;
+        try {
+            // Only the outer TopN is rewritten. Probing its output `y` resolves to lazy_col, which the
+            // inner TopN still reads through `lazy_col AS x`, so lazy_col must stay materialized.
+            PhysicalPlan plan = postProcess("select y from (select lazy_col as x, lazy_col as y, other_col as z "
+                    + "from lazy_materialize_nested_topn_tbl order by x limit 2) s order by z limit 1");
+            Assertions.assertTrue(
+                    plan.collectToList(node -> node instanceof PhysicalLazyMaterialize).isEmpty(),
+                    plan.treeString());
+
+            // A column that nothing below the TopN reads may still be fetched lazily through the TopNs.
+            plan = postProcess("select w from (select lazy_col as x, other_col as w, lazy_col as y, sort_col "
+                    + "from lazy_materialize_nested_topn_tbl order by x limit 2) s order by sort_col limit 1");
+            List<PhysicalLazyMaterialize<? extends Plan>> materializeNodes = plan.collectToList(
+                    node -> node instanceof PhysicalLazyMaterialize);
+            Assertions.assertEquals(1, materializeNodes.size(), plan.treeString());
+            Assertions.assertEquals(ImmutableList.of(ImmutableList.of(2)),
+                    materializeNodes.get(0).getLazyBaseColumnIndices());
+        } finally {
+            connectContext.getSessionVariable().feDebug = feDebug;
+        }
+    }
+
+    @Test
+    public void testIndexFilterPredicateSlotStaysLazy() throws Exception {
+        this.createTable("create table lazy_materialize_index_filter_tbl("
+                + "user_id bigint, username varchar(50), age int, addr varchar(50)) "
+                + "duplicate key(user_id, username) distributed by hash(user_id) buckets 1 "
+                + "properties('replication_num' = '1')");
+        boolean feDebug = connectContext.getSessionVariable().feDebug;
+        boolean usingIndex = connectContext.getSessionVariable().topNLazyMaterializationUsingIndex;
+        connectContext.getSessionVariable().feDebug = false;
+        connectContext.getSessionVariable().topNLazyMaterializationUsingIndex = true;
+        try {
+            // The filter is evaluated through the index, so its predicate column is kept by the scan for
+            // the predicate and re-materialized lazily above the TopN. It must stay lazy even though an
+            // operator below the TopN consumes it.
+            PhysicalPlan plan = postProcess("select * from lazy_materialize_index_filter_tbl "
+                    + "where user_id = 1 order by username limit 1");
+            List<PhysicalLazyMaterialize<? extends Plan>> materializeNodes = plan.collectToList(
+                    node -> node instanceof PhysicalLazyMaterialize);
+            Assertions.assertEquals(1, materializeNodes.size(), plan.treeString());
+            List<Integer> lazyColumnIndexes = Lists.newArrayList();
+            materializeNodes.get(0).getLazyBaseColumnIndices().forEach(lazyColumnIndexes::addAll);
+            lazyColumnIndexes.sort(Integer::compareTo);
+            Assertions.assertEquals(ImmutableList.of(0, 2, 3), lazyColumnIndexes, plan.treeString());
+        } finally {
+            connectContext.getSessionVariable().feDebug = feDebug;
+            connectContext.getSessionVariable().topNLazyMaterializationUsingIndex = usingIndex;
+        }
+    }
+
+    @Test
+    public void testLateralGenerateConjunctKeepsItsAliasSourceMaterialized() throws Exception {
+        this.createTable("create table lazy_materialize_lateral_tbl("
+                + "sort_col int, lazy_col int, other_col int, arr array<int>) "
+                + "duplicate key(sort_col) distributed by hash(sort_col) buckets 1 "
+                + "properties('replication_num' = '1')");
+        boolean feDebug = connectContext.getSessionVariable().feDebug;
+        connectContext.getSessionVariable().feDebug = false;
+        try {
+            // The generate conjunct reads `x`, which is an alias of lazy_col. PhysicalGenerate exposes
+            // only its generators through getInputSlots(), so the conjunct inputs have to be resolved
+            // explicitly: otherwise lazy_col is pruned from the scan while `lazy_col AS x` below the
+            // generate still reads it. Only other_col (read by nothing below the TopN) stays lazy.
+            PhysicalPlan plan = postProcess("select s.y, s.w from (select lazy_col as x, lazy_col as y, "
+                    + "other_col as w, arr, sort_col from lazy_materialize_lateral_tbl) s "
+                    + "left join lateral unnest(s.arr) tt(tag) on tt.tag = s.x "
+                    + "order by s.sort_col limit 1");
+            List<PhysicalLazyMaterialize<? extends Plan>> materializeNodes = plan.collectToList(
+                    node -> node instanceof PhysicalLazyMaterialize);
+            Assertions.assertEquals(1, materializeNodes.size(), plan.treeString());
+            Assertions.assertEquals(ImmutableList.of(ImmutableList.of(2)),
+                    materializeNodes.get(0).getLazyBaseColumnIndices(), plan.treeString());
+
+            // The conjunct reads the bare lazy_col, which the same Project also aliases as `y`. Probing
+            // `y` resolves through that alias to lazy_col and no operator below the TopN stops the probe
+            // for the bare slot, so lazy_col has to stay materialized for the conjunct as well.
+            plan = postProcess("select s.y, s.w from (select lazy_col as y, other_col as w, arr, sort_col, "
+                    + "lazy_col from lazy_materialize_lateral_tbl) s "
+                    + "left join lateral unnest(s.arr) tt(tag) on tt.tag = s.lazy_col "
+                    + "order by s.sort_col limit 1");
+            materializeNodes = plan.collectToList(node -> node instanceof PhysicalLazyMaterialize);
+            Assertions.assertEquals(1, materializeNodes.size(), plan.treeString());
+            Assertions.assertEquals(ImmutableList.of(ImmutableList.of(2)),
+                    materializeNodes.get(0).getLazyBaseColumnIndices(), plan.treeString());
+        } finally {
+            connectContext.getSessionVariable().feDebug = feDebug;
+        }
+    }
+
+    private PhysicalPlan postProcess(String sql) {
+        PlanChecker checker = PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .implement();
+        return new PlanPostProcessors(checker.getCascadesContext()).process(checker.getPhysicalPlan());
     }
 
     @Test

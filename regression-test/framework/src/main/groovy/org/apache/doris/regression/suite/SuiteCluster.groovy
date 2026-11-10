@@ -23,14 +23,12 @@ import org.apache.doris.regression.util.JdbcUtils
 import org.apache.doris.regression.util.NodeType
 
 import com.google.common.collect.Maps
-import org.awaitility.Awaitility
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
 import groovy.json.JsonSlurper
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
-import static java.util.concurrent.TimeUnit.SECONDS
 import java.util.stream.Collectors
 import java.sql.Connection
 
@@ -100,6 +98,10 @@ class ClusterOptions {
 
     String tdeAk = "";
     String tdeSk = "";
+    String tdeAwsAk = "";
+    String tdeAwsSk = "";
+    String tdeAliyunAk = "";
+    String tdeAliyunSk = "";
 
     // Use external meta service cluster (shared MS/FDB)
     // Specify the cluster name that provides MS/FDB services
@@ -422,6 +424,26 @@ class SuiteCluster {
             cmd += options.tdeSk
         }
 
+        if (options.tdeAwsAk != null && options.tdeAwsAk != "") {
+            cmd += ['--tde-aws-ak']
+            cmd += options.tdeAwsAk
+        }
+
+        if (options.tdeAwsSk != null && options.tdeAwsSk != "") {
+            cmd += ['--tde-aws-sk']
+            cmd += options.tdeAwsSk
+        }
+
+        if (options.tdeAliyunAk != null && options.tdeAliyunAk != "") {
+            cmd += ['--tde-aliyun-ak']
+            cmd += options.tdeAliyunAk
+        }
+
+        if (options.tdeAliyunSk != null && options.tdeAliyunSk != "") {
+            cmd += ['--tde-aliyun-sk']
+            cmd += options.tdeAliyunSk
+        }
+
         if (options.externalMsCluster != null && options.externalMsCluster != "") {
             cmd += ['--external-ms', options.externalMsCluster]
         }
@@ -597,7 +619,7 @@ class SuiteCluster {
     }
 
     List<Integer> addFrontend(int num, boolean followerMode=false) throws Exception {
-        def result = add(0, num, '', false, null)
+        def result = add(num, 0, '', followerMode, null)
         return result.first
     }
 
@@ -888,16 +910,34 @@ class SuiteCluster {
         runCmd(cmd, timeoutSecond)
     }
 
+    // Waits for a doris-compose process to exit and its output to be read, for at most timeoutSecond;
+    // one that outlives that is destroyed and the command fails, the way atMost() failed it when the
+    // wait ran on Awaitility's own thread. The framework polls Awaitility conditions on the calling
+    // thread (RegressionTest.initGroovyEnv), so an atMost() around a blocking call no longer bounds
+    // it: a condition that waits on something other than a statement bounds the wait itself. The
+    // wait runs on a helper thread so that the timeout can be enforced from here; waitForProcessOutput
+    // joins the two stream readers, so the buffers are complete once the thread has ended.
+    private static void waitForDorisCompose(Process proc, StringBuilder outBuf, StringBuilder errBuf,
+                                            int timeoutSecond) throws Exception {
+        Thread waiter = Thread.start('doris-compose-wait') {
+            proc.waitForProcessOutput(outBuf, errBuf)
+        }
+        waiter.join(timeoutSecond * 1000L)
+        if (waiter.isAlive()) {
+            proc.destroyForcibly()
+            waiter.join(10 * 1000L)
+            throw new Exception(String.format('doris compose cmd did not finish within %d seconds and was killed,'
+                    + ' stdout: %s, stderr: %s', timeoutSecond, outBuf.toString(), errBuf.toString()))
+        }
+    }
+
     private Object runCmd(String cmd, int timeoutSecond = 60) throws Exception {
         def fullCmd = String.format('python -W ignore %s %s -v --output-json', config.dorisComposePath, cmd)
         logger.info('Run doris compose cmd: {}', fullCmd)
         def proc = fullCmd.execute()
         def outBuf = new StringBuilder()
         def errBuf = new StringBuilder()
-        Awaitility.await().atMost(timeoutSecond, SECONDS).until({
-            proc.waitForProcessOutput(outBuf, errBuf)
-            return true
-        })
+        waitForDorisCompose(proc, outBuf, errBuf, timeoutSecond)
         if (proc.exitValue() != 0) {
             throw new Exception(String.format('Exit value: %s != 0, stdout: %s, stderr: %s',
                                               proc.exitValue(), outBuf.toString(), errBuf.toString()))
@@ -914,16 +954,38 @@ class SuiteCluster {
     }
 
     // Execute command with proper argument list to avoid shell escaping issues
+    private static List<String> maskSensitiveArgs(List<String> cmdList) {
+        Set<String> sensitiveOptions = [
+                '--tde-ak',
+                '--tde-sk',
+                '--tde-aws-ak',
+                '--tde-aws-sk',
+                '--tde-aliyun-ak',
+                '--tde-aliyun-sk'
+        ] as Set
+        List<String> masked = []
+        boolean maskNext = false
+        for (String arg : cmdList) {
+            if (maskNext) {
+                masked += '***'
+                maskNext = false
+                continue
+            }
+            masked += arg
+            if (sensitiveOptions.contains(arg)) {
+                maskNext = true
+            }
+        }
+        return masked
+    }
+
     private Object runCmdList(List<String> cmdList, int timeoutSecond = 60) throws Exception {
         def fullCmdList = ['python', '-W', 'ignore', config.dorisComposePath] + cmdList + ['-v', '--output-json']
-        logger.info('Run doris compose cmd: {}', fullCmdList.join(' '))
+        logger.info('Run doris compose cmd: {}', maskSensitiveArgs(fullCmdList).join(' '))
         def proc = fullCmdList.execute()
         def outBuf = new StringBuilder()
         def errBuf = new StringBuilder()
-        Awaitility.await().atMost(timeoutSecond, SECONDS).until({
-            proc.waitForProcessOutput(outBuf, errBuf)
-            return true
-        })
+        waitForDorisCompose(proc, outBuf, errBuf, timeoutSecond)
         if (proc.exitValue() != 0) {
             throw new Exception(String.format('Exit value: %s != 0, stdout: %s, stderr: %s',
                                               proc.exitValue(), outBuf.toString(), errBuf.toString()))

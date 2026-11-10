@@ -33,6 +33,19 @@
 
 namespace doris {
 
+namespace {
+io::IOContext create_index_io_context(const io::IOContext* source, OlapReaderStatistics* stats) {
+    io::IOContext io_ctx;
+    if (source != nullptr) {
+        io_ctx = *source;
+    }
+    io_ctx.is_index_data = true;
+    io_ctx.is_inverted_index = false;
+    io_ctx.file_cache_stats = stats ? &stats->file_cache_stats : nullptr;
+    return io_ctx;
+}
+} // namespace
+
 static bvar::Adder<size_t> g_primary_key_index_memory_bytes("doris_primary_key_index_memory_bytes");
 
 Status PrimaryKeyIndexBuilder::init() {
@@ -56,9 +69,10 @@ Status PrimaryKeyIndexBuilder::init() {
 }
 
 Status PrimaryKeyIndexBuilder::add_item(const Slice& key) {
-    RETURN_IF_ERROR(_primary_key_index_builder->add(&key));
+    RETURN_IF_ERROR(_primary_key_index_builder->add(reinterpret_cast<const uint8_t*>(&key)));
     Slice key_without_seq = Slice(key.get_data(), key.get_size() - _seq_col_length - _rowid_length);
-    RETURN_IF_ERROR(_bloom_filter_index_builder->add_values(&key_without_seq, 1));
+    RETURN_IF_ERROR(_bloom_filter_index_builder->add_values(
+            reinterpret_cast<const uint8_t*>(&key_without_seq), 1));
     // the key is already sorted, so the first key is min_key, and
     // the last key is max_key.
     if (UNLIKELY(_num_rows == 0)) {
@@ -96,28 +110,36 @@ Status PrimaryKeyIndexBuilder::finalize(segment_v2::PrimaryKeyIndexMetaPB* meta)
 
 Status PrimaryKeyIndexReader::parse_index(io::FileReaderSPtr file_reader,
                                           const segment_v2::PrimaryKeyIndexMetaPB& meta,
-                                          OlapReaderStatistics* pk_index_load_stats) {
+                                          OlapReaderStatistics* pk_index_load_stats,
+                                          const io::IOContext* source_io_ctx) {
     // parse primary key index
-    _index_reader.reset(new segment_v2::IndexedColumnReader(file_reader, meta.primary_key_index()));
-    _index_reader->set_is_pk_index(true);
-    RETURN_IF_ERROR(_index_reader->load(!config::disable_pk_storage_page_cache, false,
-                                        pk_index_load_stats));
+    auto index_reader = std::make_unique<segment_v2::IndexedColumnReader>(file_reader,
+                                                                          meta.primary_key_index());
+    index_reader->set_is_pk_index(true);
+    auto io_ctx = create_index_io_context(source_io_ctx, pk_index_load_stats);
+    RETURN_IF_ERROR(index_reader->load(!config::disable_pk_storage_page_cache, false,
+                                       pk_index_load_stats, &io_ctx));
 
+    // A failed initialization must not leave partially loaded root pages pinned in
+    // a cached segment without a corresponding eviction charge.
+    _index_reader = std::move(index_reader);
     _index_parsed = true;
     return Status::OK();
 }
 
 Status PrimaryKeyIndexReader::parse_bf(io::FileReaderSPtr file_reader,
                                        const segment_v2::PrimaryKeyIndexMetaPB& meta,
-                                       OlapReaderStatistics* pk_index_load_stats) {
+                                       OlapReaderStatistics* pk_index_load_stats,
+                                       const io::IOContext* source_io_ctx) {
     // parse bloom filter
     segment_v2::ColumnIndexMetaPB column_index_meta = meta.bloom_filter_index();
     segment_v2::BloomFilterIndexReader bf_index_reader(std::move(file_reader),
                                                        column_index_meta.bloom_filter_index());
+    auto io_ctx = create_index_io_context(source_io_ctx, pk_index_load_stats);
     RETURN_IF_ERROR(bf_index_reader.load(!config::disable_pk_storage_page_cache, false,
-                                         pk_index_load_stats));
+                                         pk_index_load_stats, &io_ctx));
     std::unique_ptr<segment_v2::BloomFilterIndexIterator> bf_iter;
-    RETURN_IF_ERROR(bf_index_reader.new_iterator(&bf_iter, pk_index_load_stats));
+    RETURN_IF_ERROR(bf_index_reader.new_iterator(&bf_iter, pk_index_load_stats, &io_ctx));
     RETURN_IF_ERROR(bf_iter->read_bloom_filter(0, &_bf));
     segment_v2::g_pk_total_bloom_filter_num << 1;
     segment_v2::g_pk_total_bloom_filter_total_bytes << _bf->size();

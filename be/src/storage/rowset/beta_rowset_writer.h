@@ -47,7 +47,7 @@ namespace doris {
 class Block;
 
 namespace segment_v2 {
-class SegmentWriter;
+class VerticalSegmentWriter;
 } // namespace segment_v2
 
 using SegCompactionCandidates = std::vector<segment_v2::SegmentSharedPtr>;
@@ -87,7 +87,7 @@ public:
     // `seg_id` -> inverted index file writer
     Status add(int seg_id, IndexFileWriterPtr&& writer);
 
-    // Close all file writers
+    // Close all file writers that are still open
     // If the inverted index file writer is not closed, an error will be thrown during destruction
     Status begin_close();
 
@@ -118,6 +118,8 @@ public:
 
     ~BaseBetaRowsetWriter() override;
 
+    void cancel_calc_delete_bitmap(const Status& st) override;
+
     Status init(const RowsetWriterContext& rowset_writer_context) override;
 
     Status add_block(const Block* block) override;
@@ -141,6 +143,7 @@ public:
     // Return the file size flushed to disk in "flush_size"
     // This method is thread-safe.
     Status flush_single_block(const Block* block) override;
+    Status flush_single_block(const Block* block, int32_t segment_id) override;
 
     RowsetSharedPtr manual_build(const RowsetMetaSharedPtr& rowset_meta) override;
 
@@ -166,15 +169,19 @@ public:
         return Status::OK();
     }
 
-    int32_t allocate_segment_id() override { return _segment_creator.allocate_segment_id(); };
+    Result<int32_t> allocate_segment_id() override {
+        return _segment_creator.allocate_segment_id();
+    };
 
     int32_t get_allocated_segment_id() override {
         return _segment_creator.get_allocated_segment_id();
     };
 
-    void set_segment_start_id(int32_t start_id) override {
-        _segment_creator.set_segment_start_id(start_id);
-        _segment_start_id = start_id;
+    void set_segment_start_id(int32_t start_seg_id,
+                              int32_t max_seg_num = MAX_SEGMENT_NUM) override {
+        _context.set_first_segment_id(start_seg_id);
+        _segment_creator.set_segment_start_id(start_seg_id, max_seg_num);
+        _segment_start_id = start_seg_id;
     }
 
     Status force_rollback() override {
@@ -209,9 +216,12 @@ private:
     // for this segment
 protected:
     Status _generate_delete_bitmap(int32_t segment_id);
-    virtual Status _build_rowset_meta(RowsetMeta* rowset_meta, bool check_segment_num = false);
+    // `completed_segment_ids`, when requested, is populated from the same statistics snapshot
+    // used to build the rowset meta.
+    virtual Status _build_rowset_meta(RowsetMeta* rowset_meta, bool check_segment_num = false,
+                                      std::vector<int64_t>* completed_segment_ids = nullptr);
     Status _create_file_writer(const std::string& path, io::FileWriterPtr& file_writer,
-                               bool is_index_file = false);
+                               FileType file_type = FileType::SEGMENT_FILE);
     virtual Status _close_file_writers();
     virtual Status _check_segment_number_limit(size_t segnum);
     virtual int64_t _num_seg() const;
@@ -222,9 +232,9 @@ protected:
         std::lock_guard l(_segid_statistics_map_mutex);
         return std::accumulate(_segment_num_rows.begin(), _segment_num_rows.end(), uint64_t(0));
     }
-    // Only during vertical compaction is this method called
     // Some index files are written during normal compaction and some files are written during index compaction.
     // After all index writes are completed, call this method to write the final compound index file.
+    // Index files sealed when their segment was flushed only wait for that close to finish.
     Status _close_inverted_index_file_writers() {
         RETURN_NOT_OK_STATUS_WITH_WARN(_idx_files.begin_close(),
                                        "failed to close index file when build new rowset");
@@ -289,10 +299,10 @@ public:
     Status add_segment(uint32_t segment_id, const SegmentStatistics& segstat) override;
 
     Status flush_segment_writer_for_segcompaction(
-            std::unique_ptr<segment_v2::SegmentWriter>* writer, uint64_t index_size,
+            std::unique_ptr<segment_v2::VerticalSegmentWriter>* writer, uint64_t index_size,
             KeyBoundsPB& key_bounds);
     Status create_segment_writer_for_segcompaction(
-            std::unique_ptr<segment_v2::SegmentWriter>* writer, int64_t begin, int64_t end);
+            std::unique_ptr<segment_v2::VerticalSegmentWriter>* writer, int64_t begin, int64_t end);
 
     bool is_segcompacted() const { return _num_segcompacted > 0; }
 
@@ -310,7 +320,7 @@ private:
     Status _rename_compacted_segments(int64_t begin, int64_t end);
     Status _rename_compacted_segment_plain(uint32_t seg_id);
     Status _rename_compacted_indices(int64_t begin, int64_t end, uint64_t seg_id);
-    Status _remove_segment_footer_cache(const uint32_t seg_id, const std::string& segment_path);
+    Status _remove_segment_footer_cache(uint32_t seg_pos, const std::string& segment_path);
     void _clear_statistics_for_deleting_segments_unsafe(uint32_t begin, uint32_t end);
 
     StorageEngine& _engine;
@@ -330,9 +340,9 @@ private:
     std::atomic<int> _segcompaction_status {ErrorCode::OK};
 };
 
-class RowBinlogRowsetWriter : public BetaRowsetWriter {
+class ChangelogRowsetWriter : public BetaRowsetWriter {
 public:
-    RowBinlogRowsetWriter(StorageEngine& engine);
+    ChangelogRowsetWriter(StorageEngine& engine);
 };
 
 } // namespace doris

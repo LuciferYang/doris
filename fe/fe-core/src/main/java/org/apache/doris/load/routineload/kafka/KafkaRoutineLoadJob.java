@@ -33,6 +33,7 @@ import org.apache.doris.common.InternalErrorCode;
 import org.apache.doris.common.LoadException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.util.DatasourcePrintableMap;
 import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.LogBuilder;
@@ -56,6 +57,7 @@ import org.apache.doris.nereids.trees.plans.commands.AlterRoutineLoadCommand;
 import org.apache.doris.nereids.trees.plans.commands.info.CreateRoutineLoadInfo;
 import org.apache.doris.persist.AlterRoutineLoadJobOperationLog;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.resource.computegroup.ComputeGroupBindingUtil;
 import org.apache.doris.rpc.RpcException;
 import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.thrift.TFileCompressType;
@@ -82,6 +84,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
 import java.util.UUID;
@@ -102,6 +105,7 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
     private static final String READ_COMMITTED_ZERO_ROWS_WITH_LAG_MESSAGE = "Kafka routine load consumed 0 rows "
             + "while lag is still positive under isolation.level=read_committed. If the upstream producer uses "
             + "Kafka transactions, some records may be in uncommitted transactions and are not visible yet.";
+    private static final String SENSITIVE_PROPERTY_MASK = "******";
 
     @SerializedName("bl")
     private String brokerList;
@@ -443,12 +447,32 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
             if (customKafkaPartitions != null && !customKafkaPartitions.isEmpty()) {
                 return true;
             }
-            return updateKafkaPartitions();
+            return updateKafkaPartitions(needAutoResume);
         }
         return true;
     }
 
-    private boolean updateKafkaPartitions() throws UserException {
+    private boolean updateKafkaPartitions(boolean needAutoResume) throws UserException {
+        // The metadata request goes to the backends of the declared compute group, and after RESUME it runs
+        // before any task, so check the group here as RoutineLoadTaskScheduler does before each task. A
+        // dropped group would otherwise pause the job with "no alive backends" and the Kafka advice below.
+        //
+        // Not for an auto resume attempt, which is left to that check before the first task. The job is still
+        // PAUSED during the attempt and can not be paused again with another reason, so a failure here would
+        // keep its old, retryable one: a revoked USAGE would never become CANNOT_RESUME_ERR, and auto resume
+        // would retry for good. Once the metadata request below succeeds, the attempt moves the job to
+        // NEED_SCHEDULE, and the check before its first task records the failure.
+        if (!needAutoResume) {
+            try {
+                ComputeGroupBindingUtil.checkComputeGroupBeforeTask(getUserIdentity(), getDeclaredComputeGroup());
+            } catch (UserException e) {
+                LOG.warn(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, id)
+                        .add("error_msg", e.getMessage())
+                        .build());
+                pauseIfNeedSchedule(new ErrorReason(e.getErrorCode(), e.getMessage()));
+                return false;
+            }
+        }
         try {
             this.newCurrentKafkaPartition = getAllKafkaPartitions();
         } catch (Exception e) {
@@ -458,11 +482,7 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
             LOG.warn(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, id)
                     .add("error_msg", msg)
                     .build(), e);
-            if (this.state == JobState.NEED_SCHEDULE) {
-                unprotectUpdateState(JobState.PAUSED,
-                        new ErrorReason(InternalErrorCode.PARTITIONS_ERR, msg),
-                        false /* not replay */);
-            }
+            pauseIfNeedSchedule(new ErrorReason(InternalErrorCode.PARTITIONS_ERR, msg));
             return false;
         }
         return true;
@@ -549,7 +569,12 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
 
     private List<Integer> getAllKafkaPartitions() throws UserException {
         convertCustomProperties(false);
-        return KafkaUtil.getAllKafkaPartitions(brokerList, topic, convertedCustomProperties);
+        String computeGroupName = getComputeGroupName();
+        return KafkaUtil.getAllKafkaPartitions(brokerList, topic, convertedCustomProperties, computeGroupName);
+    }
+
+    private String getComputeGroupName() {
+        return Config.isCloudMode() ? getCloudCluster() : null;
     }
 
     public static KafkaRoutineLoadJob fromCreateInfo(CreateRoutineLoadInfo info, ConnectContext ctx)
@@ -649,13 +674,14 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
         for (Integer kafkaPartition : newPartitions) {
             partitionOffsets.add(Pair.of(kafkaPartition, beginOffset));
         }
+        String computeGroupName = getComputeGroupName();
         try {
             if (isOffsetForTimes()) {
                 partitionOffsets = KafkaUtil.getOffsetsForTimes(this.brokerList,
-                        this.topic, convertedCustomProperties, partitionOffsets);
+                        this.topic, convertedCustomProperties, partitionOffsets, computeGroupName);
             } else {
                 partitionOffsets = KafkaUtil.getRealOffsets(this.brokerList,
-                        this.topic, convertedCustomProperties, partitionOffsets);
+                        this.topic, convertedCustomProperties, partitionOffsets, computeGroupName);
             }
         } catch (LoadException e) {
             LOG.warn(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, id)
@@ -687,15 +713,18 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
 
         List<Pair<Integer, Long>> kafkaPartitionOffsets = kafkaDataSourceProperties.getKafkaPartitionOffsets();
         boolean isForTimes = kafkaDataSourceProperties.isOffsetsForTimes();
+        String computeGroupName = getComputeGroupName();
         if (isForTimes) {
             // the offset is set by date time, we need to get the real offset by time
             kafkaPartitionOffsets = KafkaUtil.getOffsetsForTimes(kafkaDataSourceProperties.getBrokerList(),
                     kafkaDataSourceProperties.getTopic(),
-                    convertedCustomProperties, kafkaDataSourceProperties.getKafkaPartitionOffsets());
+                    convertedCustomProperties, kafkaDataSourceProperties.getKafkaPartitionOffsets(),
+                    computeGroupName);
         } else {
             kafkaPartitionOffsets = KafkaUtil.getRealOffsets(kafkaDataSourceProperties.getBrokerList(),
                     kafkaDataSourceProperties.getTopic(),
-                    convertedCustomProperties, kafkaDataSourceProperties.getKafkaPartitionOffsets());
+                    convertedCustomProperties, kafkaDataSourceProperties.getKafkaPartitionOffsets(),
+                    computeGroupName);
         }
 
         for (Pair<Integer, Long> partitionOffset : kafkaPartitionOffsets) {
@@ -723,7 +752,31 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
     @Override
     public String customPropertiesJsonToString() {
         Gson gson = new GsonBuilder().disableHtmlEscaping().create();
-        return gson.toJson(customProperties);
+        return gson.toJson(getMaskedCustomProperties(""));
+    }
+
+    private Map<String, String> getMaskedCustomProperties(String keyPrefix) {
+        Map<String, String> maskedProperties = new HashMap<>();
+        customProperties.forEach((key, value) -> {
+            String lowerKey = key.toLowerCase(Locale.ROOT);
+            boolean sensitive = KafkaConfiguration.SASL_JAAS_CONFIG.equalsIgnoreCase(key)
+                    || KafkaConfiguration.AWS_ACCESS_KEY.equalsIgnoreCase(key)
+                    || DatasourcePrintableMap.isSensitiveKey(key)
+                    || lowerKey.endsWith(".password")
+                    || lowerKey.endsWith(".secret")
+                    || lowerKey.endsWith(".secret_key")
+                    || lowerKey.endsWith(".secret.key")
+                    || lowerKey.endsWith(".session_key")
+                    || lowerKey.endsWith(".session.token")
+                    || lowerKey.contains(".private.key.")
+                    || lowerKey.endsWith(".private.key")
+                    || lowerKey.endsWith(".private_key")
+                    || lowerKey.endsWith(".passphrase")
+                    || "ssl.keystore.key".equals(lowerKey)
+                    || "ssl.key.pem".equals(lowerKey);
+            maskedProperties.put(keyPrefix + key, sensitive ? SENSITIVE_PROPERTY_MASK : value);
+        });
+        return maskedProperties;
     }
 
     @Override
@@ -736,22 +789,27 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
 
     @Override
     public Map<String, String> getCustomProperties() {
-        Map<String, String> ret = new HashMap<>();
-        customProperties.forEach((k, v) -> ret.put("property." + k, v));
-        return ret;
+        return getMaskedCustomProperties("property.");
     }
 
     @Override
     public void modifyProperties(AlterRoutineLoadCommand command) throws UserException {
         Map<String, String> jobProperties = command.getAnalyzedJobProperties();
         KafkaDataSourceProperties dataSourceProperties = (KafkaDataSourceProperties) command.getDataSourceProperties();
+        String declaredComputeGroup = jobProperties.get(CreateRoutineLoadInfo.COMPUTE_GROUP);
         if (null != dataSourceProperties) {
+            // The offsets are converted before modifyPropertiesInternal installs the new properties,
+            // so a compute group this ALTER declares has to be used already: for
+            // ALTER ... PROPERTIES("compute_group" = "cg_b") FROM KAFKA("kafka_offsets" = "OFFSET_END")
+            // the job's current group may be gone, which is why it is being moved to cg_b.
             // if the partition offset is set by timestamp, convert it to real offset
-            convertOffset(dataSourceProperties);
+            convertOffset(dataSourceProperties, Strings.isNullOrEmpty(declaredComputeGroup)
+                    ? getComputeGroupName() : declaredComputeGroup);
         }
 
         writeLock();
         try {
+            checkAlteredWorkloadGroup(jobProperties);
             if (getState() != JobState.PAUSED) {
                 throw new DdlException("Only supports modification of PAUSED jobs");
             }
@@ -766,16 +824,19 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
         }
     }
 
-    private void convertOffset(KafkaDataSourceProperties dataSourceProperties) throws UserException {
+    private void convertOffset(KafkaDataSourceProperties dataSourceProperties, String computeGroupName)
+            throws UserException {
         List<Pair<Integer, Long>> partitionOffsets = dataSourceProperties.getKafkaPartitionOffsets();
         if (partitionOffsets.isEmpty()) {
             return;
         }
         List<Pair<Integer, Long>> newOffsets;
         if (dataSourceProperties.isOffsetsForTimes()) {
-            newOffsets = KafkaUtil.getOffsetsForTimes(brokerList, topic, convertedCustomProperties, partitionOffsets);
+            newOffsets = KafkaUtil.getOffsetsForTimes(
+                    brokerList, topic, convertedCustomProperties, partitionOffsets, computeGroupName);
         } else {
-            newOffsets = KafkaUtil.getRealOffsets(brokerList, topic, convertedCustomProperties, partitionOffsets);
+            newOffsets = KafkaUtil.getRealOffsets(
+                    brokerList, topic, convertedCustomProperties, partitionOffsets, computeGroupName);
         }
         dataSourceProperties.setKafkaPartitionOffsets(newOffsets);
     }
@@ -889,6 +950,25 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
         }
     }
 
+    boolean isTaskLagGreaterThanMaxBatchRows(Map<Integer, Long> partitionIdToOffset) {
+        long remainingRows = Math.max(maxBatchRows, RoutineLoadJob.DEFAULT_MAX_BATCH_ROWS);
+        for (Map.Entry<Integer, Long> entry : partitionIdToOffset.entrySet()) {
+            Long latestOffset = cachedPartitionWithLatestOffsets.get(entry.getKey());
+            if (latestOffset == null) {
+                continue;
+            }
+            long partitionLag = latestOffset - entry.getValue();
+            if (partitionLag <= 0) {
+                continue;
+            }
+            if (partitionLag > remainingRows) {
+                return true;
+            }
+            remainingRows -= partitionLag;
+        }
+        return false;
+    }
+
     // check if given partitions has more data to consume.
     // 'partitionIdToOffset' to the offset to be consumed.
     public boolean hasMoreDataToConsume(UUID taskId, Map<Integer, Long> partitionIdToOffset) throws UserException {
@@ -931,8 +1011,10 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
             } finally {
                 writeUnlock();
             }
+            String computeGroupName = getComputeGroupName();
             List<Pair<Integer, Long>> tmp = KafkaUtil.getLatestOffsets(id, taskId, brokerListSnapshot,
-                    topicSnapshot, customPropertiesSnapshot, Lists.newArrayList(partitionIdToOffset.keySet()));
+                    topicSnapshot, customPropertiesSnapshot, Lists.newArrayList(partitionIdToOffset.keySet()),
+                    computeGroupName);
             updateLatestOffsetsCache(tmp, taskId);
         } catch (Exception e) {
             // It needs to pause job when can not get partition meta.
@@ -995,8 +1077,9 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
             writeUnlock();
         }
         UUID taskId = UUID.randomUUID();
+        String computeGroupName = getComputeGroupName();
         List<Pair<Integer, Long>> latestOffsets = KafkaUtil.getLatestOffsets(id, taskId, brokerListSnapshot,
-                topicSnapshot, customPropertiesSnapshot, partitionIds);
+                topicSnapshot, customPropertiesSnapshot, partitionIds, computeGroupName);
         updateLatestOffsetsCache(latestOffsets, taskId);
     }
 

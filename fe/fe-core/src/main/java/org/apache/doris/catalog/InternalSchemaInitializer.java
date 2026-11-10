@@ -254,10 +254,12 @@ public class InternalSchemaInitializer extends Thread {
                                     InternalCatalog.INTERNAL_CATALOG_NAME,
                                     StatisticConstants.DB_NAME,
                                     tbl.getName());
-                            // 1. modify table's default replica num
+                            // 1. modify table's default replica allocation
                             Map<String, String> props = new HashMap<>();
-                            props.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_NUM,
-                                    "" + StatisticConstants.STATISTIC_INTERNAL_TABLE_REPLICA_NUM);
+                            ReplicaAllocation replicaAllocation = new ReplicaAllocation(
+                                    (short) StatisticConstants.STATISTIC_INTERNAL_TABLE_REPLICA_NUM);
+                            props.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
+                                    replicaAllocation.toCreateStmt());
                             Env.getCurrentEnv().modifyTableDefaultReplicaAllocation(database, tbl, props);
 
                             // 2. modify each partition's replica num
@@ -352,6 +354,7 @@ public class InternalSchemaInitializer extends Thread {
          *   `error_code` int NULL COMMENT "",
          *   `error_message` text NULL COMMENT "",
          *   `query_time` bigint NULL COMMENT "",
+         *   `queue_time_ms` bigint NULL COMMENT "",
          *   `cpu_time_ms` bigint NULL COMMENT "",
          *   `peak_memory_bytes` bigint NULL COMMENT "",
          *   `scan_bytes` bigint NULL COMMENT "",
@@ -361,6 +364,8 @@ public class InternalSchemaInitializer extends Thread {
          *   `shuffle_send_bytes` bigint NULL COMMENT "",
          *   `spill_write_bytes_from_local_storage` bigint NULL COMMENT "",
          *   `spill_read_bytes_from_local_storage` bigint NULL COMMENT "",
+         *   `spill_write_bytes_to_remote_storage` bigint NULL COMMENT "",
+         *   `spill_read_bytes_from_remote_storage` bigint NULL COMMENT "",
          *   `scan_bytes_from_local_storage` bigint NULL COMMENT "",
          *   `scan_bytes_from_remote_storage` bigint NULL COMMENT "",
          *   `parse_time_ms` int NULL COMMENT "",
@@ -382,6 +387,7 @@ public class InternalSchemaInitializer extends Thread {
          *   `is_internal` tinyint NULL COMMENT "",
          *   `workload_group` text NULL COMMENT "",
          *   `compute_group` text NULL COMMENT "",
+         *   `protocol` varchar(16) NULL COMMENT "",
          *   `stmt` text NULL COMMENT ""
          * ) ENGINE = olap
          * DUPLICATE KEY(`query_id`, `time`, `client_ip`)

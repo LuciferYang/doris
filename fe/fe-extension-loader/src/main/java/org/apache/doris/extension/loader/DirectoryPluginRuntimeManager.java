@@ -19,6 +19,9 @@ package org.apache.doris.extension.loader;
 
 import org.apache.doris.extension.spi.PluginFactory;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.MalformedURLException;
@@ -36,6 +39,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -48,7 +52,7 @@ import java.util.stream.Stream;
  *
  * <h2>Responsibilities</h2>
  *
- * <p>The {@link #loadAll(List, ClassLoader, Class, ClassLoadingPolicy)} flow:
+ * <p>The {@link #loadAll(List, ClassLoader, Class, ClassLoadingPolicy, ApiVersionGate)} flow:
  * <ol>
  *   <li>Scans each root in {@code pluginRoots} and treats its direct
  *       subdirectories as plugin directories.</li>
@@ -58,6 +62,8 @@ import java.util.stream.Stream;
  *       configurable parent-first package-prefix policy.</li>
  *   <li>Discovers exactly one typed factory via {@link java.util.ServiceLoader}
  *       (for example, {@code AuthenticationPluginFactory}).</li>
+ *   <li>Checks the plugin API version the jar declares against the one the caller's
+ *       {@link ApiVersionGate} expects, before any plugin code runs.</li>
  *   <li>Validates and records load outcomes and returns a {@link LoadReport}
  *       with successes and failures.</li>
  * </ol>
@@ -78,8 +84,8 @@ import java.util.stream.Stream;
  *
  * <p>Failures are staged for observability and troubleshooting:
  * {@code scan}, {@code resolve}, {@code createClassLoader}, {@code discover},
- * {@code instantiate}, and {@code conflict}. Per-directory failures do not stop
- * other directories from loading.
+ * {@code apiVersion}, {@code instantiate}, and {@code conflict}. Per-directory
+ * failures do not stop other directories from loading.
  *
  * <h2>Conflict Strategy</h2>
  *
@@ -101,14 +107,24 @@ import java.util.stream.Stream;
  */
 public class DirectoryPluginRuntimeManager<F extends PluginFactory> {
 
+    private static final Logger LOG = LogManager.getLogger(DirectoryPluginRuntimeManager.class);
+
     private final ConcurrentMap<String, PluginHandle<F>> handlesByName = new ConcurrentHashMap<>();
     private final Object lifecycleLock = new Object();
 
+    /**
+     * Loads every plugin directory found under {@code pluginRoots}.
+     *
+     * @param apiVersionGate the caller family's plugin API contract. Mandatory and never nullable: an
+     *        optional gate would reintroduce exactly the failure mode this check exists to remove — a
+     *        version check that silently admits everything because nobody wired it up.
+     */
     public LoadReport<F> loadAll(List<Path> pluginRoots, ClassLoader parent, Class<F> factoryType,
-            ClassLoadingPolicy policy) {
+            ClassLoadingPolicy policy, ApiVersionGate apiVersionGate) {
         Objects.requireNonNull(pluginRoots, "pluginRoots");
         Objects.requireNonNull(parent, "parent");
         Objects.requireNonNull(factoryType, "factoryType");
+        Objects.requireNonNull(apiVersionGate, "apiVersionGate");
         ClassLoadingPolicy effectivePolicy = policy != null ? policy : ClassLoadingPolicy.defaultPolicy();
 
         List<Path> pluginDirs = new ArrayList<>();
@@ -127,7 +143,8 @@ public class DirectoryPluginRuntimeManager<F extends PluginFactory> {
         synchronized (lifecycleLock) {
             for (Path pluginDir : pluginDirs) {
                 try {
-                    PluginHandle<F> handle = loadFromPluginDir(pluginDir, parent, factoryType, effectivePolicy);
+                    PluginHandle<F> handle = loadFromPluginDir(pluginDir, parent, factoryType, effectivePolicy,
+                            apiVersionGate);
                     if (handlesByName.containsKey(handle.getPluginName())) {
                         closeClassLoader(handle.getClassLoader());
                         failures.add(new LoadFailure(
@@ -149,6 +166,21 @@ public class DirectoryPluginRuntimeManager<F extends PluginFactory> {
 
     public Optional<PluginHandle<F>> get(String pluginName) {
         return Optional.ofNullable(handlesByName.get(pluginName));
+    }
+
+    /**
+     * Removes a loaded handle and closes its classloader. For callers that reject
+     * a successfully loaded plugin after the fact (e.g. a family-level name
+     * conflict with an already registered provider); without this the factory and
+     * its classloader would stay strongly retained for the FE lifetime.
+     */
+    public void discard(String pluginName) {
+        synchronized (lifecycleLock) {
+            PluginHandle<F> handle = handlesByName.remove(pluginName);
+            if (handle != null) {
+                closeClassLoader(handle.getClassLoader());
+            }
+        }
     }
 
     public List<PluginHandle<F>> list() {
@@ -192,7 +224,7 @@ public class DirectoryPluginRuntimeManager<F extends PluginFactory> {
     }
 
     private PluginHandle<F> loadFromPluginDir(Path pluginDir, ClassLoader parent, Class<F> factoryType,
-            ClassLoadingPolicy policy) throws PluginLoadException {
+            ClassLoadingPolicy policy, ApiVersionGate apiVersionGate) throws PluginLoadException {
         Path normalizedDir = normalize(pluginDir);
 
         // Collect root-level jars (plugin primary jars) and lib/ jars (dependencies) separately.
@@ -237,10 +269,48 @@ public class DirectoryPluginRuntimeManager<F extends PluginFactory> {
             }
             // Re-load and instantiate the factory class from the runtime classloader so that it
             // has full access to lib/ classes (e.g. CosFileSystemProvider needs S3 classes).
+            Class<?> discoveredClass;
+            try {
+                discoveredClass = classLoader.loadClass(factoryClassName);
+            } catch (ReflectiveOperationException e) {
+                throw new PluginLoadException(
+                        normalizedDir,
+                        LoadFailure.STAGE_INSTANTIATE,
+                        "Failed to instantiate factory class '" + factoryClassName + "' in " + normalizedDir,
+                        e);
+            }
+
+            // Version check before construction, and before asSubclass(): a plugin built against a
+            // different SPI major is precisely the one whose types may no longer line up, so it must be
+            // answered with a diagnosis naming both versions rather than with a cast or linkage error.
+            String declaredApiVersion;
+            try {
+                declaredApiVersion = readManifestMainAttribute(
+                        discoveredClass, allJars, apiVersionGate.getManifestAttribute());
+            } catch (IOException e) {
+                throw new PluginLoadException(
+                        normalizedDir,
+                        LoadFailure.STAGE_API_VERSION,
+                        "Failed to read " + apiVersionGate.getManifestAttribute() + " for factory '"
+                                + factoryClassName + "' in " + normalizedDir + ": " + e.getMessage(),
+                        e);
+            }
+            String rejection = apiVersionGate.rejectionReason(declaredApiVersion);
+            if (rejection != null) {
+                throw new PluginLoadException(
+                        normalizedDir,
+                        LoadFailure.STAGE_API_VERSION,
+                        "Rejected plugin in " + normalizedDir + ": " + rejection,
+                        null);
+            }
+            String acceptanceWarning = apiVersionGate.acceptanceWarning(declaredApiVersion);
+            if (acceptanceWarning != null) {
+                LOG.warn("Loading legacy unversioned plugin from {}: {}", normalizedDir, acceptanceWarning);
+            }
+
             try {
                 @SuppressWarnings("unchecked")
-                Class<? extends F> factoryClass = (Class<? extends F>)
-                        classLoader.loadClass(factoryClassName).asSubclass(factoryType);
+                Class<? extends F> factoryClass = (Class<? extends F>) discoveredClass.asSubclass(factoryType);
                 factory = factoryClass.getDeclaredConstructor().newInstance();
             } catch (ReflectiveOperationException e) {
                 throw new PluginLoadException(
@@ -254,10 +324,12 @@ public class DirectoryPluginRuntimeManager<F extends PluginFactory> {
             throw e;
         }
 
+        // Snapshot self-reported metadata once at load time. A throwing or invalid
+        // self-report is a load failure; query paths never re-invoke plugin code.
         String pluginName;
         try {
             pluginName = factory.name();
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             closeClassLoader(classLoader);
             throw new PluginLoadException(
                     normalizedDir,
@@ -265,14 +337,32 @@ public class DirectoryPluginRuntimeManager<F extends PluginFactory> {
                     "Failed to get plugin name from discovered factory in " + normalizedDir,
                     e);
         }
-        if (pluginName == null || pluginName.trim().isEmpty()) {
+        String nameValidationError = PluginNames.validate(pluginName);
+        if (nameValidationError != null) {
             closeClassLoader(classLoader);
             throw new PluginLoadException(
                     normalizedDir,
                     LoadFailure.STAGE_INSTANTIATE,
-                    "Plugin name is empty for directory: " + normalizedDir,
+                    "Invalid plugin name for directory " + normalizedDir + ": " + nameValidationError,
                     null);
         }
+
+        // LinkageError included: a factory jar with a broken classpath (or one
+        // compiled against a conflicting interface) must fail this plugin only,
+        // never escape per-plugin isolation.
+        String description;
+        try {
+            description = factory.description();
+        } catch (RuntimeException | LinkageError e) {
+            closeClassLoader(classLoader);
+            throw new PluginLoadException(
+                    normalizedDir,
+                    LoadFailure.STAGE_INSTANTIATE,
+                    "Failed to get plugin description from discovered factory in " + normalizedDir,
+                    e);
+        }
+
+        String version = readImplementationVersion(factory.getClass(), allJars);
 
         return new PluginHandle<>(
                 pluginName.trim(),
@@ -280,7 +370,62 @@ public class DirectoryPluginRuntimeManager<F extends PluginFactory> {
                 allJars,
                 classLoader,
                 factory,
-                Instant.now());
+                Instant.now(),
+                description,
+                version);
+    }
+
+    /** Extracts one datum from an open plugin jar's MANIFEST. */
+    private interface ManifestReader {
+        String read(JarFile jarFile) throws IOException;
+    }
+
+    /**
+     * Applies {@code reader} to the MANIFEST of the jar that defined the factory class: the class's code
+     * source when available (covers layouts where the service descriptor sits in a root jar but the
+     * implementation lives in lib/), otherwise the first candidate jar containing the class entry.
+     *
+     * <p>Null means a readable defining jar genuinely omitted the requested datum. An unreadable or
+     * unresolved defining jar throws: the API gate must not mistake failed verification for an absent
+     * legacy declaration. Once the code source identifies a jar, another candidate cannot replace it.
+     */
+    private String readFromDefiningJar(Class<?> factoryClass, List<Path> candidateJars, ManifestReader reader)
+            throws IOException {
+        Path definingJar = ManifestVersions.jarOf(factoryClass);
+        if (definingJar != null) {
+            try (JarFile jarFile = new JarFile(definingJar.toFile())) {
+                return reader.read(jarFile);
+            }
+        }
+        String classEntry = factoryClass.getName().replace('.', '/') + ".class";
+        for (Path jar : candidateJars) {
+            try (JarFile jarFile = new JarFile(jar.toFile())) {
+                if (jarFile.getEntry(classEntry) == null) {
+                    continue;
+                }
+                return reader.read(jarFile);
+            }
+        }
+        throw new IOException("Cannot locate defining jar for factory '" + factoryClass.getName() + "'");
+    }
+
+    /** Implementation-Version, honoring the class's package section. Display-only metadata. */
+    private String readImplementationVersion(Class<?> factoryClass, List<Path> candidateJars) {
+        String packagePath = ManifestVersions.packagePathOf(factoryClass);
+        try {
+            return readFromDefiningJar(factoryClass, candidateJars,
+                    jarFile -> ManifestVersions.fromManifest(jarFile, packagePath));
+        } catch (IOException ignored) {
+            // Display-only metadata may be unavailable without making a verified plugin unloadable.
+            return null;
+        }
+    }
+
+    /** The plugin API version a jar declares, as a MANIFEST main attribute. Null when absent. */
+    private String readManifestMainAttribute(Class<?> factoryClass, List<Path> candidateJars,
+            String attributeName) throws IOException {
+        return readFromDefiningJar(factoryClass, candidateJars,
+                jarFile -> ManifestVersions.mainAttribute(jarFile, attributeName));
     }
 
     /**

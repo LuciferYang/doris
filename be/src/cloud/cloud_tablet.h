@@ -18,12 +18,15 @@
 #pragma once
 
 #include <memory>
+#include <optional>
+#include <tuple>
 
 #include "storage/partial_update_info.h"
 #include "storage/rowset/rowset.h"
 #include "storage/tablet/base_tablet.h"
 
 namespace doris {
+class TTabletInfo;
 
 class CloudStorageEngine;
 
@@ -55,7 +58,7 @@ struct SyncRowsetStats {
     int64_t tablet_meta_cache_miss {0};
 
     int64_t bthread_schedule_delay_ns {0};
-    int64_t meta_lock_wait_ns {0}; // _meta_lock (std::shared_mutex) wait across all acquisitions
+    int64_t meta_lock_wait_ns {0}; // _meta_lock (BthreadSharedMutex) wait across all acquisitions
     int64_t sync_meta_lock_wait_ns {
             0}; // _sync_meta_lock (bthread::Mutex) wait across all acquisitions
 };
@@ -71,11 +74,17 @@ struct SyncOptions {
 struct RecycledRowsets {
     RowsetId rowset_id;
     int64_t num_segments;
+    std::vector<int64_t> segment_ids;
     std::vector<std::string> index_file_names;
 };
 
 class CloudTablet final : public BaseTablet {
 public:
+    // rowset id -> [(segment id, version, serialized delete bitmap size)]
+    using PreRowsetDeleteBitmapStats = std::map<
+            std::string,
+            std::vector<std::tuple<DeleteBitmap::SegmentId, DeleteBitmap::Version, size_t>>>;
+
     CloudTablet(CloudStorageEngine& engine, TabletMetaSharedPtr tablet_meta);
 
     ~CloudTablet() override;
@@ -152,19 +161,19 @@ public:
     // If 'need_download_data_async' is true, it means that we need to download the new version
     // rowsets datum async.
     void add_rowsets(std::vector<RowsetSharedPtr> to_add, bool version_overlap,
-                     std::unique_lock<std::shared_mutex>& meta_lock,
+                     std::unique_lock<BthreadSharedMutex>& meta_lock,
                      bool warmup_delta_data = false);
 
     // MUST hold EXCLUSIVE `_meta_lock`.
     void delete_rowsets(const std::vector<RowsetSharedPtr>& to_delete,
-                        std::unique_lock<std::shared_mutex>& meta_lock);
+                        std::unique_lock<BthreadSharedMutex>& meta_lock);
 
     // Like delete_rowsets, but also removes edges from the version graph.
     // Used by schema change to prevent the greedy capture algorithm from
     // preferring stale compaction rowsets over individual SC output rowsets.
     // MUST hold EXCLUSIVE `_meta_lock`.
     void delete_rowsets_for_schema_change(const std::vector<RowsetSharedPtr>& to_delete,
-                                          std::unique_lock<std::shared_mutex>& meta_lock,
+                                          std::unique_lock<BthreadSharedMutex>& meta_lock,
                                           bool recycle_deleted_rowsets = true);
 
     // Replace local rowsets in [2, alter_version] with schema change output rowsets.
@@ -175,7 +184,7 @@ public:
     // MUST hold EXCLUSIVE `_meta_lock`.
     void replace_rowsets_with_schema_change_output(
             const std::vector<RowsetSharedPtr>& output_rowsets, int64_t alter_version,
-            std::unique_lock<std::shared_mutex>& meta_lock, const char* stage,
+            std::unique_lock<BthreadSharedMutex>& meta_lock, const char* stage,
             bool recycle_deleted_rowsets);
 
     // When the tablet is dropped, we need to recycle cached data:
@@ -285,7 +294,8 @@ public:
         _last_active_time_ms = time_ms;
     }
 
-    std::vector<RowsetSharedPtr> pick_candidate_rowsets_to_base_compaction();
+    // MUST hold SHARED `_meta_lock`.
+    std::vector<RowsetSharedPtr> pick_candidate_rowsets_to_base_compaction_unlocked();
 
     inline Version max_version() const {
         std::shared_lock rdlock(_meta_lock);
@@ -294,7 +304,8 @@ public:
 
     int64_t base_size() const { return _base_size; }
 
-    std::vector<RowsetSharedPtr> pick_candidate_rowsets_to_full_compaction();
+    // MUST hold SHARED `_meta_lock`.
+    std::vector<RowsetSharedPtr> pick_candidate_rowsets_to_full_compaction_unlocked();
     Result<RowsetSharedPtr> pick_a_rowset_for_index_change(int schema_version,
                                                            bool& is_base_rowset);
     Status check_rowset_schema_for_build_index(std::vector<TColumn>& columns, int schema_version);
@@ -339,7 +350,14 @@ public:
 
     const auto& rowset_map() const { return _rs_version_map; }
 
-    int64_t last_sync_time_s = 0;
+    // How long since this tablet's ROWSETS were pulled from MS. Only sync_rowsets() advances
+    // it, and only when it actually issues the RPC.
+    int64_t last_sync_rowsets_time_s = 0;
+    // How long since this tablet's META was pulled from MS, which is what carries properties
+    // such as the file cache TTL. Only sync_meta() advances it. Tracked separately on
+    // purpose: a tablet under continuous ingest keeps the rowsets clock permanently fresh,
+    // so gating meta work on that one starves the meta refresh entirely.
+    int64_t last_sync_tablet_meta_time_s = 0;
     int64_t last_load_time_ms = 0;
     int64_t last_base_compaction_success_time_ms = 0;
     int64_t last_cumu_compaction_success_time_ms = 0;
@@ -355,10 +373,11 @@ public:
     // check that if the delete bitmap in delete bitmap cache has the same cardinality with the expected_delete_bitmap's
     Status check_delete_bitmap_cache(int64_t txn_id, DeleteBitmap* expected_delete_bitmap) override;
 
-    void agg_delete_bitmap_for_compaction(int64_t start_version, int64_t end_version,
-                                          const std::vector<RowsetSharedPtr>& pre_rowsets,
-                                          DeleteBitmapPtr& new_delete_bitmap,
-                                          std::map<std::string, int64_t>& pre_rowset_to_versions);
+    void agg_delete_bitmap_for_compaction(
+            int64_t start_version, int64_t end_version,
+            const std::vector<RowsetSharedPtr>& pre_rowsets, DeleteBitmapPtr& new_delete_bitmap,
+            std::map<std::string, int64_t>& pre_rowset_to_versions,
+            PreRowsetDeleteBitmapStats* pre_rowset_delete_bitmap_stats);
 
     bool need_remove_unused_rowsets();
 
@@ -372,16 +391,23 @@ public:
 
     // Add warmup state management
     WarmUpState get_rowset_warmup_state(RowsetId rowset_id);
-    bool add_rowset_warmup_state(
+    std::optional<uint64_t> add_rowset_warmup_state(
             const RowsetMeta& rowset, WarmUpTriggerSource source,
             std::chrono::steady_clock::time_point start_tp = std::chrono::steady_clock::now());
     bool update_rowset_warmup_state_inverted_idx_num(WarmUpTriggerSource source, RowsetId rowset_id,
-                                                     int64_t delta);
+                                                     int64_t delta, uint64_t generation);
     bool update_rowset_warmup_state_inverted_idx_num_unlocked(WarmUpTriggerSource source,
-                                                              RowsetId rowset_id, int64_t delta);
+                                                              RowsetId rowset_id, int64_t delta,
+                                                              uint64_t generation);
     WarmUpState complete_rowset_segment_warmup(WarmUpTriggerSource trigger_source,
                                                RowsetId rowset_id, Status status,
-                                               int64_t segment_num, int64_t inverted_idx_num);
+                                               int64_t segment_num, int64_t inverted_idx_num,
+                                               uint64_t generation);
+
+    // Warmup can arrive before metadata sync and never enter the local Rowset GC lifecycle.
+    size_t gc_rowset_warmup_states(
+            std::chrono::seconds grace_period,
+            std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
     bool is_rowset_warmed_up(const RowsetId& rowset_id) const;
 
@@ -427,7 +453,7 @@ private:
 
     Status sync_if_not_running(SyncRowsetStats* stats = nullptr);
 
-    bool add_rowset_warmup_state_unlocked(
+    std::optional<uint64_t> add_rowset_warmup_state_unlocked(
             const RowsetMeta& rowset, WarmUpTriggerSource source,
             std::chrono::steady_clock::time_point start_tp = std::chrono::steady_clock::now());
 
@@ -440,15 +466,15 @@ private:
             std::chrono::system_clock::time_point freshness_limit_tp) const;
 
     // Submit a segment download task for warming up
-    void _submit_segment_download_task(const RowsetSharedPtr& rs,
-                                       const StorageResource* storage_resource, int seg_id,
-                                       int64_t expiration_time);
+    void _submit_segment_download_task(const RowsetSharedPtr& rs, io::Path segment_path,
+                                       int64_t segment_file_size, int64_t expiration_time,
+                                       uint64_t generation);
 
     // Submit an inverted index download task for warming up
     void _submit_inverted_index_download_task(const RowsetSharedPtr& rs,
                                               const StorageResource* storage_resource,
                                               const io::Path& idx_path, int64_t idx_size,
-                                              int64_t expiration_time);
+                                              int64_t expiration_time, uint64_t generation);
 
     // Add rowsets directly with warmup
     void _add_rowsets_directly(std::vector<RowsetSharedPtr>& rowsets, bool warmup_delta_data);
@@ -486,11 +512,9 @@ private:
     std::atomic<int64_t> _last_base_compaction_schedule_millis;
     // timestamp of last full compaction schedule time
     std::atomic<int64_t> _last_full_compaction_schedule_millis;
-
     std::string _last_cumu_compaction_status;
     std::string _last_base_compaction_status;
     std::string _last_full_compaction_status;
-
     int64_t _base_compaction_cnt = 0;
     int64_t _cumulative_compaction_cnt = 0;
     int64_t _full_compaction_cnt = 0;
@@ -513,6 +537,7 @@ private:
     // for warm up states management
     struct RowsetWarmUpInfo {
         WarmUpState state;
+        uint64_t generation = 0;
         int64_t num_segments = 0;
         int64_t num_inverted_idx = 0;
         int64_t num_segments_warmed_up = 0;
@@ -532,6 +557,7 @@ private:
 
         void update_state();
     };
+    uint64_t _next_warmup_generation = 0;
     std::unordered_map<RowsetId, RowsetWarmUpInfo> _rowset_warm_up_states;
 
     mutable std::shared_mutex _warmed_up_rowsets_mutex;

@@ -33,6 +33,7 @@ import org.apache.doris.thrift.TStorageMedium;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -44,6 +45,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -54,6 +56,10 @@ import java.util.Map;
  */
 public class TableProperty implements GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(TableProperty.class);
+    private static final String DEFAULT_REPLICATION_NUM =
+            "default." + PropertyAnalyzer.PROPERTIES_REPLICATION_NUM;
+    private static final String DEFAULT_REPLICATION_ALLOCATION =
+            "default." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION;
 
     @SerializedName(value = "properties")
     private Map<String, String> properties;
@@ -75,6 +81,11 @@ public class TableProperty implements GsonPostProcessable {
     private String storagePolicy = "";
     private Boolean isBeingSynced = null;
     private BinlogConfig binlogConfig;
+    private ChangelogConfig changelogConfig;
+    // True when "properties" still enables changelog through "binlog.format" = "ROW", the configuration the
+    // changelog.* properties replaced. Such a table has neither CCR binlog nor changelog and can only be
+    // dropped. Derived from "properties", not persisted.
+    private boolean legacyChangelog = false;
 
     private TStorageMedium storageMedium = null;
 
@@ -179,6 +190,9 @@ public class TableProperty implements GsonPostProcessable {
                 buildAutoAnalyzeProperty();
                 buildPartitionRetentionCount();
                 buildColumnSeqMapping();
+                break;
+            case OperationType.OP_UPDATE_BINLOG_CONFIG:
+                buildBinlogConfig();
                 break;
             default:
                 break;
@@ -541,7 +555,7 @@ public class TableProperty implements GsonPostProcessable {
         if (Strings.isNullOrEmpty(storageMediumStr)) {
             storageMedium = null;
         } else {
-            storageMedium = TStorageMedium.valueOf(storageMediumStr);
+            storageMedium = TStorageMedium.valueOf(storageMediumStr.toUpperCase(Locale.ROOT));
         }
         return this;
     }
@@ -592,30 +606,24 @@ public class TableProperty implements GsonPostProcessable {
         return Lists.newArrayList(rowStoreColumns);
     }
 
+    /**
+     * Builds the CCR binlog config and the changelog config from "properties". The binlog keys the changelog.*
+     * properties replaced are dropped, unless they still enable changelog: that table keeps them, so that it is
+     * recognized again after every restart, and gets neither config.
+     */
     public TableProperty buildBinlogConfig() {
-        BinlogConfig binlogConfig = new BinlogConfig();
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE)) {
-            binlogConfig.setEnable(Boolean.parseBoolean(properties.get(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE)));
+        legacyChangelog = PropertyAnalyzer.isLegacyChangelog(properties);
+        if (legacyChangelog) {
+            binlogConfig = new BinlogConfig();
+            changelogConfig = new ChangelogConfig();
+            return this;
         }
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_TTL_SECONDS)) {
-            binlogConfig.setTtlSeconds(Long.parseLong(properties.get(PropertyAnalyzer.PROPERTIES_BINLOG_TTL_SECONDS)));
+        PropertyAnalyzer.removeLegacyBinlogProperties(properties);
+        binlogConfig = BinlogConfig.fromProperties(properties);
+        changelogConfig = ChangelogConfig.fromProperties(properties);
+        if (properties.containsKey(ChangelogConfig.CONFIG_VERSION)) {
+            changelogConfig.setConfigVersion(Long.parseLong(properties.get(ChangelogConfig.CONFIG_VERSION)));
         }
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_BYTES)) {
-            binlogConfig.setMaxBytes(Long.parseLong(properties.get(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_BYTES)));
-        }
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_HISTORY_NUMS)) {
-            binlogConfig.setMaxHistoryNums(
-                    Long.parseLong(properties.get(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_HISTORY_NUMS)));
-        }
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_FORMAT)) {
-            binlogConfig.setBinlogFormat(BinlogConfig.BinlogFormat.valueOf(
-                    properties.get(PropertyAnalyzer.PROPERTIES_BINLOG_FORMAT)));
-        }
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_NEED_HISTORICAL_VALUE)) {
-            binlogConfig.setNeedHistoricalValue(Boolean.parseBoolean(
-                    properties.get(PropertyAnalyzer.PROPERTIES_BINLOG_NEED_HISTORICAL_VALUE)));
-        }
-        this.binlogConfig = binlogConfig;
         return this;
     }
 
@@ -627,20 +635,29 @@ public class TableProperty implements GsonPostProcessable {
     }
 
     public void setBinlogConfig(BinlogConfig newBinlogConfig) {
-        Map<String, String> binlogProperties = Maps.newHashMap();
-        binlogProperties.put(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE, String.valueOf(newBinlogConfig.getEnable()));
-        binlogProperties.put(PropertyAnalyzer.PROPERTIES_BINLOG_TTL_SECONDS,
-                String.valueOf(newBinlogConfig.getTtlSeconds()));
-        binlogProperties.put(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_BYTES,
-                String.valueOf(newBinlogConfig.getMaxBytes()));
-        binlogProperties.put(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_HISTORY_NUMS,
-                String.valueOf(newBinlogConfig.getMaxHistoryNums()));
-        binlogProperties.put(PropertyAnalyzer.PROPERTIES_BINLOG_FORMAT,
-                String.valueOf(newBinlogConfig.getBinlogFormat()));
-        binlogProperties.put(PropertyAnalyzer.PROPERTIES_BINLOG_NEED_HISTORICAL_VALUE,
-                String.valueOf(newBinlogConfig.getNeedHistoricalValue()));
-        modifyTableProperties(binlogProperties);
+        modifyTableProperties(newBinlogConfig.toProperties());
         this.binlogConfig = newBinlogConfig;
+    }
+
+    public ChangelogConfig getChangelogConfig() {
+        if (changelogConfig == null) {
+            buildBinlogConfig();
+        }
+        return changelogConfig;
+    }
+
+    // Only a table with changelog stores the changelog.* properties.
+    public void setChangelogConfig(ChangelogConfig newChangelogConfig) {
+        Preconditions.checkArgument(newChangelogConfig.isEnable(), newChangelogConfig);
+        modifyTableProperties(newChangelogConfig.toProperties());
+        this.changelogConfig = newChangelogConfig;
+    }
+
+    public boolean isLegacyChangelog() {
+        if (binlogConfig == null) {
+            buildBinlogConfig();
+        }
+        return legacyChangelog;
     }
 
     public TableProperty buildDataSortInfo() {
@@ -678,8 +695,21 @@ public class TableProperty implements GsonPostProcessable {
     }
 
     public void modifyTableProperties(Map<String, String> modifyProperties) {
+        // Compatibility note: ModifyTablePropertyOperationLog persists only properties to set, not keys removed
+        // here. Keep its payload unchanged for this legacy repair. During a rolling FE upgrade, alter these
+        // properties on a table that already contains both legacy keys only after all FEs have been upgraded;
+        // otherwise old and new FEs may apply different effective replica settings.
+        removeConflictingDefaultReplicaProperty(modifyProperties);
         properties.putAll(modifyProperties);
         removeDuplicateReplicaNumProperty();
+    }
+
+    private void removeConflictingDefaultReplicaProperty(Map<String, String> modifyProperties) {
+        if (modifyProperties.containsKey(DEFAULT_REPLICATION_ALLOCATION)) {
+            properties.remove(DEFAULT_REPLICATION_NUM);
+        } else if (modifyProperties.containsKey(DEFAULT_REPLICATION_NUM)) {
+            properties.remove(DEFAULT_REPLICATION_ALLOCATION);
+        }
     }
 
     public void modifyDataSortInfoProperties(DataSortInfo dataSortInfo) {
@@ -690,8 +720,8 @@ public class TableProperty implements GsonPostProcessable {
     public void setReplicaAlloc(ReplicaAllocation replicaAlloc) {
         this.replicaAlloc = replicaAlloc;
         // set it to "properties" so that this info can be persisted
-        properties.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
-                replicaAlloc.toCreateStmt());
+        properties.remove(DEFAULT_REPLICATION_NUM);
+        properties.put(DEFAULT_REPLICATION_ALLOCATION, replicaAlloc.toCreateStmt());
     }
 
     public ReplicaAllocation getReplicaAllocation() {
@@ -744,6 +774,11 @@ public class TableProperty implements GsonPostProcessable {
         return invertedIndexFileStorageFormat;
     }
 
+    public TInvertedIndexFileStorageFormat getPartitionInvertedIndexFileStorageFormat() {
+        String format = properties.get(PropertyAnalyzer.PROPERTIES_PARTITION_INVERTED_INDEX_STORAGE_FORMAT);
+        return format == null ? null : TInvertedIndexFileStorageFormat.valueOf(format);
+    }
+
     public DataSortInfo getDataSortInfo() {
         return dataSortInfo;
     }
@@ -791,6 +826,38 @@ public class TableProperty implements GsonPostProcessable {
     public String getSequenceMapCol() {
         return properties.get(PropertyAnalyzer.PROPERTIES_FUNCTION_COLUMN + "."
                 + PropertyAnalyzer.PROPERTIES_SEQUENCE_COL);
+    }
+
+    public String getRowTtlCol() {
+        return properties.get(PropertyAnalyzer.PROPERTIES_FUNCTION_COLUMN + "."
+                + PropertyAnalyzer.PROPERTIES_TTL_COL);
+    }
+
+    public long getRowTtlDurationMicros() {
+        String value = properties.get(PropertyAnalyzer.PROPERTIES_FUNCTION_COLUMN + "."
+                + PropertyAnalyzer.PROPERTIES_TTL);
+        if (value == null) {
+            return -1;
+        }
+        try {
+            return PropertyAnalyzer.parseRowTtlDurationMicros(value);
+        } catch (AnalysisException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    // DDL requires a fixed offset for naive temporal sources; other schemas use UTC (0).
+    public int getRowTtlTimeZoneOffsetSeconds() {
+        String value = properties.get(PropertyAnalyzer.PROPERTIES_FUNCTION_COLUMN + "."
+                + PropertyAnalyzer.PROPERTIES_TTL_TIME_ZONE);
+        if (value == null) {
+            return 0;
+        }
+        try {
+            return PropertyAnalyzer.parseRowTtlTimeZoneOffsetSeconds(value);
+        } catch (AnalysisException e) {
+            throw new IllegalStateException("invalid persisted row ttl time zone: " + value, e);
+        }
     }
 
     public void setGroupCommitIntervalMs(int groupCommitIntervalMs) {
@@ -968,11 +1035,8 @@ public class TableProperty implements GsonPostProcessable {
         buildColumnSeqMapping();
     }
 
-    // For some historical reason,
-    // both "dynamic_partition.replication_num" and "dynamic_partition.replication_allocation"
-    // may be exist in "properties". we need remove the "dynamic_partition.replication_num", or it will always replace
-    // the "dynamic_partition.replication_allocation",
-    // result in unable to set "dynamic_partition.replication_allocation".
+    // Historical dynamic partition metadata may contain both replica properties. Keep the allocation form by
+    // removing replication_num because the analyzer checks it first.
     private void removeDuplicateReplicaNumProperty() {
         if (properties.containsKey(DynamicPartitionProperty.REPLICATION_NUM)
                 && properties.containsKey(DynamicPartitionProperty.REPLICATION_ALLOCATION)) {

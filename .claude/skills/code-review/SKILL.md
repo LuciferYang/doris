@@ -25,6 +25,7 @@ Use this when you need to review code, whether it is code you just completed or 
 ### 1.1 Core Invariants
 
 Always focus on the following core invariants during review:
+
 1. **Data Correctness**: Data from any committed transaction must be visible to subsequent queries and not lost; data from uncommitted transactions must not be visible
 2. **Version Consistency**: Partition visible version is the sole standard for data visibility; BE must strictly read data not exceeding this version
 3. **Delete Bitmap Consistency** (MoW tables): delete bitmap must be strictly aligned with rowset versions; sentinel marks and `TEMP_VERSION`-style placeholders must be replaced with actual versions before use
@@ -86,6 +87,7 @@ The following checkpoints must be **individually confirmed with conclusions** du
     - Can affected processes detect the change promptly without restart?
 - Does it involve incompatible changes like function symbols or storage formats? If yes:
   - Is compatibility code added? Can it correctly handle requests during rolling upgrades?
+- Does it change `gensrc/thrift` or `gensrc/proto`? If yes: read every touched definition on HEAD and on each release branch and compare. An id or enum value that means something else on another branch, a reused id, or a new required field is a finding. On a release-branch PR, an added id or enum value that is not already on master is a blocking finding. (See `gensrc/AGENTS.md`)
 - Are there functionally parallel code paths to the modified one? If yes:
   - Should this modification be applied to other paths, and has it been?
 - Are there special conditional checks? If yes:
@@ -134,7 +136,7 @@ If it involves the judgment of concurrent scenarios, it is necessary to find the
 
 - [ ] **Reservation**: `try_reserve()` before large allocations, with guaranteed release on every exit path
 - [ ] **Allocator-aware ownership**: In BE code, for memory-owning containers or buffers that should be tracked by Doris memory accounting, prefer allocator-aware types from `be/src/core/custom_allocator.h` such as `DorisVector`, `DorisMap`, and `DorisUniqueBufferPtr` instead of `std::vector`, `std::map`, and `std::unique_ptr`
-- [ ] **Ownership**: See `be/src/runtime/AGENTS.md` for cache-handle, shared_ptr-cycle, and factory-creator rules
+- [ ] **Ownership**: See `be/src/runtime/AGENTS.md` for cache-handle, shared_ptr-cycle, and factory-creator rules. See `be/src/core/AGENTS.md` for Proper application of the cow mechanism related to `IColumn`, `Block`...
 
 #### 1.3.4 Data Correctness (High Priority)
 
@@ -204,6 +206,12 @@ Detailed module review guides live in `AGENTS.md` files in each source directory
 | `cloud/src/meta-service/AGENTS.md` | Cloud transaction commit paths, RPC retry contract, Cloud MoW contract |
 | `cloud/src/recycler/AGENTS.md` | Recycler safety, two-phase delete, packed-file ordering |
 
+### Shared Definitions
+
+| Directory | Coverage |
+|-----------|----------|
+| `gensrc/AGENTS.md` | Thrift / protobuf ids and enum values: same meaning on every branch, never reused, new fields optional, added on master first |
+
 ---
 
 ## Part 3: Cross-Module Concerns
@@ -213,6 +221,7 @@ Detailed module review guides live in `AGENTS.md` files in each source directory
 - [ ] Do new `TPlanNodeType` values have matching BE handling?
 - [ ] Are all FE-to-BE send paths updated when new transmitted variables are added?
 - [ ] Is mixed-version compatibility preserved for serialization or function metadata changes?
+- [ ] For `gensrc` changes: does every id and enum value mean the same thing on every release branch, with no reused id and no new required field?
 
 ### 3.2 Cloud Mode vs Shared-Nothing Mode
 

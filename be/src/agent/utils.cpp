@@ -91,18 +91,14 @@ Status MasterServerClient::finish_task(const TFinishTaskRequest& request, TMaste
     try {
         try {
             client->finishTask(*result, request);
-        } catch ([[maybe_unused]] TTransportException& e) {
-#ifndef ADDRESS_SANITIZER
+        } catch (TTransportException& e) {
             LOG(WARNING) << "master client, retry finishTask: " << e.what();
-#endif
             client_status = client.reopen(config::thrift_rpc_timeout_ms);
             if (!client_status.ok()) {
-#ifndef ADDRESS_SANITIZER
                 LOG(WARNING) << "fail to get master client from cache. "
                              << "host=" << _cluster_info->master_fe_addr.hostname
                              << ", port=" << _cluster_info->master_fe_addr.port
                              << ", code=" << client_status.code();
-#endif
                 return Status::RpcError("Master client finish task failed");
             }
             client->finishTask(*result, request);
@@ -137,19 +133,15 @@ Status MasterServerClient::report(const TReportRequest& request, TMasterResult* 
         } catch (TTransportException& e) {
             TTransportException::TTransportExceptionType type = e.getType();
             if (type != TTransportException::TTransportExceptionType::TIMED_OUT) {
-#ifndef ADDRESS_SANITIZER
                 // if not TIMED_OUT, retry
                 LOG(WARNING) << "master client, retry finishTask: " << e.what();
-#endif
 
                 client_status = client.reopen(config::thrift_rpc_timeout_ms);
                 if (!client_status.ok()) {
-#ifndef ADDRESS_SANITIZER
                     LOG(WARNING) << "fail to get master client from cache. "
                                  << "host=" << _cluster_info->master_fe_addr.hostname
                                  << ", port=" << _cluster_info->master_fe_addr.port
                                  << ", code=" << client_status.code();
-#endif
                     return Status::InternalError("Fail to get master client from cache");
                 }
 
@@ -157,9 +149,7 @@ Status MasterServerClient::report(const TReportRequest& request, TMasterResult* 
             } else {
                 // TIMED_OUT exception. do not retry
                 // actually we don't care what FE returns.
-#ifndef ADDRESS_SANITIZER
                 LOG(WARNING) << "fail to report to master: " << e.what();
-#endif
                 return Status::InternalError("Fail to report to master");
             }
         }
@@ -193,10 +183,8 @@ Status MasterServerClient::confirm_unused_remote_files(
         } catch (TTransportException& e) {
             TTransportException::TTransportExceptionType type = e.getType();
             if (type != TTransportException::TTransportExceptionType::TIMED_OUT) {
-#ifndef ADDRESS_SANITIZER
                 // if not TIMED_OUT, retry
                 LOG(WARNING) << "master client, retry finishTask: " << e.what();
-#endif
 
                 client_status = client.reopen(config::thrift_rpc_timeout_ms);
                 if (!client_status.ok()) {
@@ -227,7 +215,27 @@ Status MasterServerClient::confirm_unused_remote_files(
     return Status::OK();
 }
 
+std::string AgentUtils::shell_quote(const std::string& argument) {
+    std::string quoted = "'";
+    for (char ch : argument) {
+        // A single quote ends a quoted section. Insert it between two quoted sections.
+        // For example, a'b becomes 'a'\''b'.
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += '\'';
+    return quoted;
+}
+
 bool AgentUtils::exec_cmd(const std::string& command, std::string* errmsg, bool redirect_stderr) {
+    // popen reads a C string. A NUL byte would discard the rest of the command.
+    if (command.find('\0') != std::string::npos) {
+        *errmsg = "The shell command contains a NUL byte.\n";
+        return false;
+    }
     // The exit status of the command.
     uint32_t rc = 0;
 

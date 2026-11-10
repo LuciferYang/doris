@@ -58,10 +58,8 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -133,6 +131,8 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
 
     // from dbProperties;
     private BinlogConfig binlogConfig = new BinlogConfig();
+    // from dbProperties, the changelog default of the tables created in the database
+    private ChangelogConfig changelogConfig = new ChangelogConfig();
 
     // ATTN: This field is only used for compatible with old version
     // Do not use it except for replaying OP_CREATE_DB
@@ -176,6 +176,11 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
 
     public void unmarkDropped() {
         isDropped = false;
+    }
+
+    /** True while the database is being dropped (before it is removed from the catalog). */
+    public boolean isDropped() {
+        return isDropped;
     }
 
     public void readLock() {
@@ -311,9 +316,24 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
 
     public void setDbProperties(DatabaseProperty dbProperties) {
         this.dbProperties = dbProperties;
-        if (PropertyAnalyzer.hasBinlogConfig(dbProperties.getProperties())) {
-            binlogConfig = dbProperties.getBinlogConfig();
+        buildBinlogConfig();
+    }
+
+    // Builds the CCR binlog config and the changelog default from dbProperties. The binlog keys the changelog.*
+    // properties replaced are dropped. A database they made a changelog default ("binlog.enable" = "true" with
+    // "binlog.format" = "ROW") would turn into a CCR database without them, so it does not enable binlog either.
+    private void buildBinlogConfig() {
+        Map<String, String> properties = dbProperties.getProperties();
+        if (PropertyAnalyzer.isLegacyChangelog(properties)) {
+            LOG.warn("database {} enables changelog with \"{}\" = \"ROW\", which is no longer supported. Reset \"{}\""
+                    + " to false, set \"{}\" = \"true\" on it to enable changelog for its new tables",
+                    fullQualifiedName, PropertyAnalyzer.PROPERTIES_LEGACY_BINLOG_FORMAT,
+                    PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE, PropertyAnalyzer.PROPERTIES_CHANGELOG_ENABLE);
+            properties.put(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE, "false");
         }
+        PropertyAnalyzer.removeLegacyBinlogProperties(properties);
+        binlogConfig = dbProperties.getBinlogConfig();
+        changelogConfig = dbProperties.getChangelogConfig();
     }
 
     public long getUsedDataQuota() {
@@ -687,7 +707,7 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
         String txnQuotaStr = dbProperties.getOrDefault(TRANSACTION_QUOTA_SIZE,
                 String.valueOf(Config.max_running_txn_num_per_db));
         transactionQuotaSize = Long.parseLong(txnQuotaStr);
-        binlogConfig = dbProperties.getBinlogConfig();
+        buildBinlogConfig();
 
         if (!Boolean.TRUE.equals(SKIP_REGISTER_NEREIDS_FUNCTIONS.get())) {
             for (ImmutableList<Function> functions : name2Function.values()) {
@@ -715,22 +735,8 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
 
     @Override
     public void write(DataOutput out) throws IOException {
-        discardHudiTable();
         Text.writeString(out, GsonUtils.GSON.toJson(this));
         writeTables(out);
-    }
-
-
-    private void discardHudiTable() {
-        Iterator<Entry<String, Table>> iterator = nameToTable.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<String, Table> entry = iterator.next();
-            if (entry.getValue().getType() == TableType.HUDI) {
-                LOG.warn("hudi table is deprecated, discard it. table name: {}", entry.getKey());
-                iterator.remove();
-                idToTable.remove(entry.getValue().getId());
-            }
-        }
     }
 
     public void analyze() {
@@ -769,16 +775,85 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
     }
 
     public synchronized void addFunction(Function function, boolean ifNotExists) throws UserException {
-        function.checkWritable();
-        if (FunctionUtil.addFunctionImpl(function, ifNotExists, false, name2Function)) {
-            Env.getCurrentEnv().getEditLog().logAddFunction(function);
-            try {
+        addFunctions(ImmutableList.of(function), ifNotExists, false);
+    }
+
+    public synchronized void addTableFunction(Function function, boolean ifNotExists) throws UserException {
+        // Doris table functions are registered as two functions: the normal function and its outer variant.
+        Function outerFunction = function.clone();
+        FunctionName name = outerFunction.getFunctionName();
+        name.setFn(name.getFunction() + "_outer");
+        List<Function> functionsToAdd = getTableFunctionsToAdd(function, outerFunction, ifNotExists);
+        if (functionsToAdd.isEmpty()) {
+            return;
+        }
+        addFunctions(functionsToAdd, false, functionsToAdd.size() > 1);
+    }
+
+    private List<Function> getTableFunctionsToAdd(Function function, Function outerFunction, boolean ifNotExists)
+            throws UserException {
+        Function existingFunction = getExistingFunction(function);
+        Function existingOuterFunction = getExistingFunction(outerFunction);
+        if (existingFunction == null && existingOuterFunction == null) {
+            return ImmutableList.of(function, outerFunction);
+        }
+        if (!ifNotExists) {
+            throw new UserException(getExistingFunctionMessage(existingFunction, existingOuterFunction));
+        }
+        return ImmutableList.of();
+    }
+
+    private String getExistingFunctionMessage(Function existingFunction, Function existingOuterFunction) {
+        List<String> existingFunctionNames = Lists.newArrayList();
+        if (existingFunction != null) {
+            existingFunctionNames.add(existingFunction.functionName());
+        }
+        if (existingOuterFunction != null) {
+            existingFunctionNames.add(existingOuterFunction.functionName());
+        }
+        return "function already exists: " + String.join(", ", existingFunctionNames);
+    }
+
+    private Function getExistingFunction(Function function) {
+        try {
+            return getFunction(getFunctionSearchDesc(function));
+        } catch (AnalysisException e) {
+            return null;
+        }
+    }
+
+    private void addFunctions(List<Function> functions, boolean ifNotExists, boolean logAsBatch) throws UserException {
+        List<Function> addedFunctions = Lists.newArrayList();
+        try {
+            for (Function function : functions) {
+                function.checkWritable();
+                if (FunctionUtil.addFunctionImpl(function, ifNotExists, false, name2Function)) {
+                    addedFunctions.add(function);
+                }
+            }
+            for (Function function : addedFunctions) {
                 FunctionUtil.translateToNereidsThrows(this.getFullName(), function);
-            } catch (Exception e) {
-                name2Function.remove(function.getFunctionName().getFunction());
-                throw e;
+            }
+        } catch (Exception e) {
+            for (Function function : addedFunctions) {
+                FunctionUtil.dropFromNereids(this.getFullName(), getFunctionSearchDesc(function));
+            }
+            for (int i = addedFunctions.size() - 1; i >= 0; i--) {
+                FunctionUtil.removeFunctionImpl(addedFunctions.get(i), true, name2Function);
+            }
+            throw e;
+        }
+        if (logAsBatch) {
+            Env.getCurrentEnv().getEditLog().logAddFunctions(addedFunctions);
+        } else {
+            for (Function function : addedFunctions) {
+                Env.getCurrentEnv().getEditLog().logAddFunction(function);
             }
         }
+    }
+
+    private FunctionSearchDesc getFunctionSearchDesc(Function function) {
+        return new FunctionSearchDesc(function.getFunctionName(), function.getArgs(), function.hasVarArgs());
     }
 
     public synchronized void replayAddFunction(Function function) {
@@ -790,7 +865,7 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
         }
     }
 
-    public synchronized void dropFunction(FunctionSearchDesc function, boolean ifExists) throws UserException {
+    public synchronized List<Long> dropFunction(FunctionSearchDesc function, boolean ifExists) throws UserException {
         Function udfFunction = null;
         try {
             // here we must first getFunction, as dropFunctionImpl will remove it
@@ -800,11 +875,13 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
                 throw new UserException(e);
             } else {
                 // ignore it, as drop it if exist, so can't sure it must exist
-                return;
+                return ImmutableList.of();
             }
         }
 
+        List<Long> droppedFunctionIds = Lists.newArrayList();
         dropFunctionImpl(function, ifExists);
+        droppedFunctionIds.add(udfFunction.getId());
         if (udfFunction != null && udfFunction.isUDTFunction()) {
             // all of the table function in doris will have two function
             // one is the normal, and another is outer, the different of them is deal with
@@ -813,8 +890,18 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
                     function.getName().getFunction() + "_outer");
             FunctionSearchDesc functionOuter = new FunctionSearchDesc(name, function.getArgTypes(),
                     function.isVariadic());
+            Function udfOuterFunction = null;
+            try {
+                udfOuterFunction = getFunction(functionOuter);
+            } catch (AnalysisException e) {
+                // Let dropFunctionImpl preserve the existing IF EXISTS and error behavior.
+            }
             dropFunctionImpl(functionOuter, ifExists);
+            if (udfOuterFunction != null) {
+                droppedFunctionIds.add(udfOuterFunction.getId());
+            }
         }
+        return droppedFunctionIds;
     }
 
     public synchronized void dropFunctionImpl(FunctionSearchDesc function, boolean ifExists) throws UserException {
@@ -938,35 +1025,46 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
 
     public void replayUpdateDbProperties(Map<String, String> properties) {
         dbProperties.updateProperties(properties);
-        if (PropertyAnalyzer.hasBinlogConfig(properties)) {
-            binlogConfig = dbProperties.getBinlogConfig();
-        }
+        buildBinlogConfig();
     }
 
     public boolean updateDbProperties(Map<String, String> properties) throws DdlException {
-        if (PropertyAnalyzer.hasBinlogConfig(properties)) {
-            BinlogConfig oldBinlogConfig = getBinlogConfig();
-            BinlogConfig newBinlogConfig = BinlogConfig.fromProperties(properties);
+        BinlogConfig oldBinlogConfig = getBinlogConfig();
+        BinlogConfig newBinlogConfig = new BinlogConfig(oldBinlogConfig);
+        newBinlogConfig.mergeFromProperties(properties);
+        ChangelogConfig newChangelogConfig = new ChangelogConfig(changelogConfig);
+        newChangelogConfig.mergeFromProperties(properties);
+        if (newChangelogConfig.isEnable()) {
+            if (newChangelogConfig.getTtlSeconds() <= 0) {
+                throw new DdlException(PropertyAnalyzer.PROPERTIES_CHANGELOG_TTL_SECONDS + " must be greater than 0");
+            }
+            if (newBinlogConfig.isEnableForCCR()) {
+                throw new DdlException("Database " + getFullName() + " can not enable both binlog and changelog");
+            }
+        }
 
-            if (newBinlogConfig.isEnableForCCR() && !oldBinlogConfig.isEnableForCCR()) {
-                // check all tables binlog enable is true
-                for (Table table : idToTable.values()) {
-                    if (!table.isManagedTable()) {
-                        continue;
-                    }
+        if (newBinlogConfig.isEnableForCCR() && !oldBinlogConfig.isEnableForCCR()) {
+            // check all tables binlog enable is true
+            for (Table table : idToTable.values()) {
+                if (!table.isManagedTable()) {
+                    continue;
+                }
 
-                    OlapTable olapTable = (OlapTable) table;
-                    olapTable.readLock();
-                    try {
-                        if (!olapTable.getBinlogConfig().isEnableForCCR()) {
-                            String errMsg = String
-                                    .format("binlog is not enable in table[%s] in db [%s]",
-                                        table.getDisplayName(), getFullName());
-                            throw new DdlException(errMsg);
-                        }
-                    } finally {
-                        olapTable.readUnlock();
+                OlapTable olapTable = (OlapTable) table;
+                olapTable.readLock();
+                try {
+                    if (olapTable.hasChangelog()) {
+                        throw new DdlException("Can not enable binlog in database " + getFullName()
+                                + " because table " + table.getDisplayName() + " enables changelog");
                     }
+                    if (!olapTable.getBinlogConfig().isEnableForCCR()) {
+                        String errMsg = String
+                                .format("binlog is not enable in table[%s] in db [%s]",
+                                    table.getDisplayName(), getFullName());
+                        throw new DdlException(errMsg);
+                    }
+                } finally {
+                    olapTable.readUnlock();
                 }
             }
         }
@@ -978,6 +1076,59 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
 
     public BinlogConfig getBinlogConfig() {
         return binlogConfig;
+    }
+
+    public ChangelogConfig getChangelogConfig() {
+        return changelogConfig;
+    }
+
+    /**
+     * Get the database binlog config snapshot and the effective table binlog config for creating a table.
+     *
+     * <p>The first value is the database binlog config snapshot, and the second value is the effective
+     * table binlog config after applying table properties.
+     */
+    public Pair<BinlogConfig, BinlogConfig> getBinlogConfigsForCreateTable(Map<String, String> tableProperties) {
+        BinlogConfig dbBinlogConfig;
+        readLock();
+        try {
+            dbBinlogConfig = new BinlogConfig(binlogConfig);
+        } finally {
+            readUnlock();
+        }
+        BinlogConfig createTableBinlogConfig = new BinlogConfig(dbBinlogConfig);
+        createTableBinlogConfig.mergeFromProperties(tableProperties);
+        return Pair.of(dbBinlogConfig, createTableBinlogConfig);
+    }
+
+    /**
+     * Get the effective table changelog config for creating a table: the database default after applying
+     * table properties. A table without changelog can not set the other changelog properties.
+     */
+    public ChangelogConfig getChangelogConfigForCreateTable(Map<String, String> tableProperties)
+            throws AnalysisException {
+        Map<String, String> changelogProperties = PropertyAnalyzer.analyzeChangelogConfig(
+                new HashMap<>(tableProperties));
+        ChangelogConfig createTableChangelogConfig;
+        readLock();
+        try {
+            createTableChangelogConfig = new ChangelogConfig(changelogConfig);
+        } finally {
+            readUnlock();
+        }
+        createTableChangelogConfig.mergeFromProperties(changelogProperties);
+        if (createTableChangelogConfig.isEnable()) {
+            createTableChangelogConfig.applyExplicitTtl(createTableChangelogConfig.getTtlSeconds());
+            return createTableChangelogConfig;
+        }
+        for (String key : Lists.newArrayList(PropertyAnalyzer.PROPERTIES_CHANGELOG_TTL_SECONDS,
+                PropertyAnalyzer.PROPERTIES_CHANGELOG_NEED_HISTORICAL_VALUE)) {
+            if (changelogProperties.containsKey(key)) {
+                throw new AnalysisException("Property " + key + " requires \""
+                        + PropertyAnalyzer.PROPERTIES_CHANGELOG_ENABLE + "\" = \"true\"");
+            }
+        }
+        return createTableChangelogConfig;
     }
 
     public void checkStorageVault(Map<String, String> properties) throws DdlException {

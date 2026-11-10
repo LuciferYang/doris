@@ -24,18 +24,19 @@ import org.apache.doris.catalog.info.IndexType;
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleType;
 import org.apache.doris.nereids.trees.expressions.Alias;
-import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.InnerProductApproximate;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.L2DistanceApproximate;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.Nullable;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTopN;
 import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
@@ -72,6 +73,11 @@ public class PushDownVectorTopNIntoOlapScan implements RewriteRuleFactory {
             LogicalProject<?> project,
             LogicalOlapScan scan,
             Optional<LogicalFilter<?>> optionalFilter) {
+        if (scan.getTable().hasRowTtl()) {
+            // ANN returns a limited candidate set from the index. TTL must first observe every
+            // post-merge row, so retain the scalar expression and the upper TopN instead.
+            return null;
+        }
         // Retrives the expression used for ordering in the TopN.
         Expression orderKey = topN.getOrderKeys().get(0).getExpr();
         // The order key must be a SlotReference corresponding to an expr.
@@ -110,10 +116,17 @@ public class PushDownVectorTopNIntoOlapScan implements RewriteRuleFactory {
             left = innerProductApproximate.left();
         }
 
-        while (left instanceof Cast) {
-            left = ((Cast) left).child();
+        Expression annOrderKeyExpr = orderKeyExpr;
+        if (left instanceof Nullable) {
+            // MV rewriting preserves nullable query outputs with a value-preserving wrapper.
+            // The ANN runtime needs the underlying indexed slot in its virtual expression.
+            while (left instanceof Nullable) {
+                left = left.child(0);
+            }
+            annOrderKeyExpr = orderKeyExpr.withChildren(left, orderKeyExpr.child(1));
         }
 
+        // ANN evaluates the indexed slot directly; surviving casts must stay on the scalar path.
         if (l2Dist) {
             if (!(left instanceof SlotReference && ((L2DistanceApproximate) orderKeyExpr).right().isConstant())) {
                 return null;
@@ -146,10 +159,17 @@ public class PushDownVectorTopNIntoOlapScan implements RewriteRuleFactory {
             return null;
         }
 
+        // When limit + offset overflows the long range, the pushed scan limit would wrap to a
+        // negative value; skip the push-down and let the TopN above the scan apply limit/offset.
+        if (Utils.addOverflows(topN.getLimit(), topN.getOffset())) {
+            return null;
+        }
+
+        // Keep the score that BindScoreToOlapScan bound to the scan.
         Plan plan = scan.appendVirtualColumnsAndTopN(
-                ImmutableList.of(orderKeyAlias),
+                ImmutableList.of((Alias) orderKeyAlias.withChildren(annOrderKeyExpr)),
                 topN.getOrderKeys(), Optional.of(topN.getLimit() + topN.getOffset()),
-                ImmutableList.of(), Optional.empty(), Optional.empty());
+                scan.getScoreOrderKeys(), scan.getScoreLimit(), scan.getScoreRangeInfo());
 
         Map<Expression, Expression> replaceMap = Maps.newHashMap();
         replaceMap.put(orderKeyAlias, orderKeyAlias.toSlot());

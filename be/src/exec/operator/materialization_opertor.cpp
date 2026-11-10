@@ -21,18 +21,178 @@
 #include <fmt/format.h>
 #include <gen_cpp/internal_service.pb.h>
 
+#include <cstring>
+#include <set>
+#include <sstream>
 #include <utility>
 
+#include "cloud/config.h"
+#include "common/config.h"
 #include "common/status.h"
 #include "core/block/block.h"
 #include "core/column/column.h"
 #include "exec/operator/operator.h"
 #include "exec/rowid_fetcher.h"
-#include "exec/scan/file_scanner.h"
+#include "exec/scan/file_scanner_v2.h"
+#include "runtime/workload_group/workload_group.h"
 #include "util/brpc_client_cache.h"
 #include "util/brpc_closure.h"
+#include "util/defer_op.h"
+#include "util/pretty_printer.h"
 
 namespace doris {
+
+namespace {
+
+void fetch_callback(bthread::CountdownEvent* counter) {
+    Defer defer([&] { counter->signal(); });
+}
+
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND =
+        "TopNLazyMaterializationSecondPhasePerBackend";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_ROWS_READ =
+        "TopNLazyMaterializationSecondPhasePerBackendRowsRead";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_SEGMENTS_READ =
+        "TopNLazyMaterializationSecondPhasePerBackendSegmentsRead";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_LOCAL_IO_COUNT =
+        "TopNLazyMaterializationSecondPhasePerBackendLocalIOCount";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_LOCAL_IO_BYTES =
+        "TopNLazyMaterializationSecondPhasePerBackendLocalIOBytes";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_REMOTE_IO_COUNT =
+        "TopNLazyMaterializationSecondPhasePerBackendRemoteIOCount";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_REMOTE_IO_BYTES =
+        "TopNLazyMaterializationSecondPhasePerBackendRemoteIOBytes";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_SKIP_CACHE_IO_COUNT =
+        "TopNLazyMaterializationSecondPhasePerBackendSkipCacheIOCount";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_WRITE_CACHE_BYTES =
+        "TopNLazyMaterializationSecondPhasePerBackendWriteCacheBytes";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_LOCAL_IO_TIME =
+        "TopNLazyMaterializationSecondPhasePerBackendLocalIOTime";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_REMOTE_IO_TIME =
+        "TopNLazyMaterializationSecondPhasePerBackendRemoteIOTime";
+constexpr const char* TOPN_LAZY_MAT_PHASE2_PER_BACKEND_WRITE_CACHE_IO_TIME =
+        "TopNLazyMaterializationSecondPhasePerBackendWriteCacheIOTime";
+
+struct MaterializationRowLocation {
+    ROW_VERSION version = ROW_VERSION::FILE_LOCAL_ROW_ID;
+    int64_t backend_id = 0;
+    uint32_t file_id = 0;
+    uint64_t row_id = 0;
+};
+
+Status decode_global_row_location_v2(const StringRef& encoded, ROW_VERSION version,
+                                     MaterializationRowLocation* decoded) {
+    if (encoded.size != sizeof(GlobalRowLoacationV2)) {
+        return Status::InternalError(
+                "invalid global row location size for version {}: actual={}, expected={}",
+                static_cast<int>(version), encoded.size, sizeof(GlobalRowLoacationV2));
+    }
+    GlobalRowLoacationV2 location(GlobalRowLoacationV2::VERSION, 0, 0, 0);
+    std::memcpy(&location, encoded.data, sizeof(location));
+    decoded->version = version;
+    decoded->backend_id = location.backend_id;
+    switch (version) {
+    case ROW_VERSION::FILE_LOCAL_ROW_ID:
+        decoded->file_id = location.file_local.file_id;
+        decoded->row_id = location.file_local.row_id;
+        return Status::OK();
+    case ROW_VERSION::LANCE_DATASET_ROW_ID:
+        decoded->file_id = location.lance_file_id;
+        decoded->row_id = location.lance_row_id;
+        return Status::OK();
+    }
+    return Status::NotSupported("unsupported V2 global row location version: {}",
+                                static_cast<int>(version));
+}
+
+Status decode_materialization_row_location(const StringRef& encoded,
+                                           MaterializationRowLocation* decoded) {
+    if (encoded.size < sizeof(uint8_t)) {
+        return Status::InternalError("global row location is empty");
+    }
+
+    const auto version_value = static_cast<uint8_t>(encoded.data[0]);
+    const auto version = static_cast<ROW_VERSION>(version_value);
+    // Keep size validation inside each version-family decoder. A future version can therefore
+    // use a different encoded size without being rejected by the current 24-byte V2 contract.
+    switch (version) {
+    case ROW_VERSION::FILE_LOCAL_ROW_ID:
+    case ROW_VERSION::LANCE_DATASET_ROW_ID:
+        return decode_global_row_location_v2(encoded, version, decoded);
+    }
+    return Status::NotSupported("unsupported global row location version: {}, encoded_size={}",
+                                static_cast<int>(version_value), encoded.size);
+}
+
+void update_counter(RuntimeProfile* profile, const std::string& name, TUnit::type unit,
+                    int64_t value) {
+    COUNTER_UPDATE(ADD_COUNTER_WITH_LEVEL(profile, name, unit, 2), value);
+}
+
+void update_topn_lazy_materialization_profile(RuntimeProfile* profile,
+                                              const PTopNLazyMaterializationFileCacheStats& stats) {
+    if (profile == nullptr) {
+        return;
+    }
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseLocalIOCount,
+                   TUnit::UNIT, stats.local_io_count());
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseLocalIOBytes,
+                   TUnit::BYTES, stats.local_io_bytes());
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseRemoteIOCount,
+                   TUnit::UNIT, stats.remote_io_count());
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseRemoteIOBytes,
+                   TUnit::BYTES, stats.remote_io_bytes());
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseSkipCacheIOCount,
+                   TUnit::UNIT, stats.skip_cache_io_count());
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseWriteCacheBytes,
+                   TUnit::BYTES, stats.write_cache_bytes());
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseLocalIOTime,
+                   TUnit::TIME_NS, stats.local_io_time());
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseRemoteIOTime,
+                   TUnit::TIME_NS, stats.remote_io_time());
+    update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseWriteCacheIOTime,
+                   TUnit::TIME_NS, stats.write_cache_io_time());
+}
+
+int64_t count_request_rows(const PMultiGetRequestV2& request) {
+    int64_t rows = 0;
+    for (const auto& request_block_desc : request.request_block_descs()) {
+        rows += request_block_desc.row_id_size();
+    }
+    return rows;
+}
+
+int64_t count_request_segments(const PMultiGetRequestV2& request) {
+    std::set<uint32_t> file_ids;
+    for (const auto& request_block_desc : request.request_block_descs()) {
+        DCHECK_EQ(request_block_desc.file_id_size(), request_block_desc.row_id_size());
+        for (const auto file_id : request_block_desc.file_id()) {
+            file_ids.insert(file_id);
+        }
+    }
+    return file_ids.size();
+}
+
+template <typename AppendValue>
+std::string format_array(size_t size, AppendValue append_value) {
+    std::stringstream values;
+    values << "[";
+    for (size_t i = 0; i < size; ++i) {
+        append_value(values, i);
+        values << ", ";
+    }
+    values << "]";
+    return values.str();
+}
+
+template <typename GetValue>
+std::string format_counter_array(size_t size, TUnit::type unit, GetValue get_value) {
+    return format_array(size, [&](std::stringstream& values, size_t i) {
+        values << PrettyPrinter::print(static_cast<int64_t>(get_value(i)), unit);
+    });
+}
+
+} // namespace
 
 void MaterializationSharedState::get_block(Block* block) {
     for (int i = 0, j = 0, rowid_to_block_loc = rowid_locs[j]; i < origin_block.columns(); i++) {
@@ -53,6 +213,98 @@ void MaterializationSharedState::get_block(Block* block) {
     origin_block.clear();
 }
 
+void MaterializationSharedState::_update_topn_lazy_materialization_profile(
+        RuntimeProfile* profile) {
+    DORIS_CHECK(profile != nullptr);
+    for (const auto& [backend_id, rpc_struct] : rpc_struct_map) {
+        const int64_t rows_read = count_request_rows(rpc_struct.request);
+        const int64_t segments_read = count_request_segments(rpc_struct.request);
+        update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseRowsRead,
+                       TUnit::UNIT, rows_read);
+        update_counter(profile, RowIdStorageReader::TopNLazyMaterializationSecondPhaseSegmentsRead,
+                       TUnit::UNIT, segments_read);
+
+        auto& stats = _topn_lazy_materialization_backend_stats[backend_id];
+        if (stats.backend.empty()) {
+            stats.backend = rpc_struct.backend_address.empty() ? fmt::format("id={}", backend_id)
+                                                               : rpc_struct.backend_address;
+        }
+        stats.rows_read += rows_read;
+        stats.segments_read += segments_read;
+        if (!rpc_struct.response.has_topn_lazy_materialization_file_cache_stats()) {
+            continue;
+        }
+
+        const auto& file_cache_stats =
+                rpc_struct.response.topn_lazy_materialization_file_cache_stats();
+        update_topn_lazy_materialization_profile(profile, file_cache_stats);
+        stats.local_io_count += file_cache_stats.local_io_count();
+        stats.local_io_bytes += file_cache_stats.local_io_bytes();
+        stats.remote_io_count += file_cache_stats.remote_io_count();
+        stats.remote_io_bytes += file_cache_stats.remote_io_bytes();
+        stats.skip_cache_io_count += file_cache_stats.skip_cache_io_count();
+        stats.write_cache_bytes += file_cache_stats.write_cache_bytes();
+        stats.local_io_time += file_cache_stats.local_io_time();
+        stats.remote_io_time += file_cache_stats.remote_io_time();
+        stats.write_cache_io_time += file_cache_stats.write_cache_io_time();
+    }
+
+    std::vector<const TopNLazyMaterializationBackendStats*> stats;
+    stats.reserve(_topn_lazy_materialization_backend_stats.size());
+    for (const auto& [_, backend_stats] : _topn_lazy_materialization_backend_stats) {
+        stats.push_back(&backend_stats);
+    }
+
+    const size_t size = stats.size();
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND,
+                             format_array(size, [&](std::stringstream& values, size_t i) {
+                                 values << stats[i]->backend;
+                             }));
+    profile->add_info_string(
+            TOPN_LAZY_MAT_PHASE2_PER_BACKEND_ROWS_READ,
+            format_counter_array(size, TUnit::UNIT, [&](size_t i) { return stats[i]->rows_read; }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_SEGMENTS_READ,
+                             format_counter_array(size, TUnit::UNIT, [&](size_t i) {
+                                 return stats[i]->segments_read;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_LOCAL_IO_COUNT,
+                             format_counter_array(size, TUnit::UNIT, [&](size_t i) {
+                                 return stats[i]->local_io_count;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_LOCAL_IO_BYTES,
+                             format_counter_array(size, TUnit::BYTES, [&](size_t i) {
+                                 return stats[i]->local_io_bytes;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_REMOTE_IO_COUNT,
+                             format_counter_array(size, TUnit::UNIT, [&](size_t i) {
+                                 return stats[i]->remote_io_count;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_REMOTE_IO_BYTES,
+                             format_counter_array(size, TUnit::BYTES, [&](size_t i) {
+                                 return stats[i]->remote_io_bytes;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_SKIP_CACHE_IO_COUNT,
+                             format_counter_array(size, TUnit::UNIT, [&](size_t i) {
+                                 return stats[i]->skip_cache_io_count;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_WRITE_CACHE_BYTES,
+                             format_counter_array(size, TUnit::BYTES, [&](size_t i) {
+                                 return stats[i]->write_cache_bytes;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_LOCAL_IO_TIME,
+                             format_counter_array(size, TUnit::TIME_NS, [&](size_t i) {
+                                 return stats[i]->local_io_time;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_REMOTE_IO_TIME,
+                             format_counter_array(size, TUnit::TIME_NS, [&](size_t i) {
+                                 return stats[i]->remote_io_time;
+                             }));
+    profile->add_info_string(TOPN_LAZY_MAT_PHASE2_PER_BACKEND_WRITE_CACHE_IO_TIME,
+                             format_counter_array(size, TUnit::TIME_NS, [&](size_t i) {
+                                 return stats[i]->write_cache_io_time;
+                             }));
+}
+
 // Merges RPC responses from multiple BEs into `response_blocks` in the original row order.
 //
 // After parallel multiget_data_v2 RPCs complete, each BE's response contains a partial block
@@ -63,7 +315,9 @@ void MaterializationSharedState::get_block(Block* block) {
 //   rpc_struct_map[backend_id].response  (per-BE partial blocks, unordered across BEs)
 //       + block_order_results[i][j]      (maps each output row → its source backend_id)
 //       → response_blocks[i]             (final merged result in original TopN row order)
-Status MaterializationSharedState::merge_multi_response() {
+Status MaterializationSharedState::merge_multi_response(RuntimeProfile* profile) {
+    _update_topn_lazy_materialization_profile(profile);
+
     // Outer loop: iterate over each relation (i.e., each rowid column / table).
     // A query with lazy materialization on 2 tables would have block_order_results.size() == 2,
     // each with its own set of response_blocks and RPC request_block_descs.
@@ -83,6 +337,12 @@ Status MaterializationSharedState::merge_multi_response() {
         // Phase 1: Deserialize the i-th response block from every BE into block_maps.
         // Each BE's response.blocks(i) corresponds to the i-th relation's fetched columns.
         for (auto& [backend_id, rpc_struct] : rpc_struct_map) {
+            const auto request_row_count = rpc_struct.request.request_block_descs(i).row_id_size();
+            // An empty request may have no response block when its RPC fails. It cannot
+            // contribute rows to block_order_results, so there is nothing to deserialize.
+            if (request_row_count == 0) {
+                continue;
+            }
             Block partial_block;
             size_t uncompressed_size = 0;
             int64_t uncompressed_time = 0;
@@ -96,13 +356,12 @@ Status MaterializationSharedState::merge_multi_response() {
             // refer 'if (!id_file_map)' in RowIdStorageReader::read_by_rowids.
             // 2. Report error in any case where the row count doesn't match, even if it's not empty,
             //    since that indicates a bug in BE's row fetching logic or serialization logic.
-            if (rpc_struct.request.request_block_descs(i).row_id_size() != partial_block.rows()) {
+            if (request_row_count != partial_block.rows()) {
                 return Status::InternalError(
                         fmt::format("merge_multi_response, "
                                     "backend_id {} returned block with row count {} not match "
                                     "request row id count {}",
-                                    backend_id, partial_block.rows(),
-                                    rpc_struct.request.request_block_descs(i).row_id_size()));
+                                    backend_id, partial_block.rows(), request_row_count));
             }
             if (rpc_struct.response.blocks(i).has_profile()) {
                 auto response_profile =
@@ -110,8 +369,7 @@ Status MaterializationSharedState::merge_multi_response() {
                 _update_profile_info(backend_id, response_profile.get());
             }
 
-            // Only insert non-empty blocks. A BE may return an empty block if
-            // request.request_block_descs(i).row_id_size() is 0
+            // Only insert non-empty blocks.
             if (!partial_block.is_empty_column()) {
                 // Reset row cursor to 0 — we'll consume rows from this block sequentially.
                 block_maps[backend_id] = std::make_pair(std::move(partial_block), 0);
@@ -172,18 +430,45 @@ Status MaterializationSharedState::merge_multi_response() {
     return Status::OK();
 }
 
+Status MaterializationSharedState::validate_rpc_results(int node_id) {
+    for (auto& [backend_id, rpc_struct] : rpc_struct_map) {
+        if (rpc_struct.cntl->Failed()) {
+            if (count_request_rows(rpc_struct.request) > 0) {
+                return Status::InternalError(
+                        "Failed to send brpc request, error_text=" + rpc_struct.cntl->ErrorText() +
+                        " Materialization Sink node id:" + std::to_string(node_id) +
+                        " target_backend_id:" + std::to_string(backend_id));
+            }
+            rpc_struct.cntl->Reset();
+            continue;
+        }
+        if (rpc_struct.response.status().status_code() != 0) {
+            Status st = Status::create(rpc_struct.response.status());
+            st.append(fmt::format(", Backend:{}, Materialization Sink node id:{}", backend_id,
+                                  node_id));
+            return st;
+        }
+        rpc_struct.cntl->Reset();
+    }
+    return Status::OK();
+}
+
 void MaterializationSharedState::_update_profile_info(int64_t backend_id,
                                                       RuntimeProfile* response_profile) {
+    DORIS_CHECK(response_profile != nullptr);
     if (!backend_profile_info_string.contains(backend_id)) {
         backend_profile_info_string.emplace(backend_id,
                                             std::map<std::string, fmt::memory_buffer> {});
     }
     auto& info_map = backend_profile_info_string[backend_id];
 
-    auto update_profile_info_key = [&](const std::string& info_key) {
+    auto update_profile_info_key = [&](const std::string& info_key, bool warn_if_missing = true) {
         const auto* info_value = response_profile->get_info_string(info_key);
         if (info_value == nullptr) [[unlikely]] {
-            LOG(WARNING) << "Get row id fetch rpc profile success, but no info key :" << info_key;
+            if (warn_if_missing) {
+                LOG(WARNING) << "Get row id fetch rpc profile success, but no info key :"
+                             << info_key;
+            }
             return;
         }
         if (!info_map.contains(info_key)) {
@@ -196,8 +481,15 @@ void MaterializationSharedState::_update_profile_info(int64_t backend_id,
     update_profile_info_key(RowIdStorageReader::InitReaderAvgTimeProfile);
     update_profile_info_key(RowIdStorageReader::GetBlockAvgTimeProfile);
     update_profile_info_key(RowIdStorageReader::FileReadLinesProfile);
-    update_profile_info_key(FileScanner::FileReadBytesProfile);
-    update_profile_info_key(FileScanner::FileReadTimeProfile);
+    update_profile_info_key(FileScannerV2::FileReadBytesProfile);
+    update_profile_info_key(FileScannerV2::FileReadTimeProfile);
+    update_profile_info_key(RowIdStorageReader::LanceDatasetOpenTimeProfile, false);
+    update_profile_info_key(RowIdStorageReader::LanceRowIdTakeReadTimeProfile, false);
+    update_profile_info_key(RowIdStorageReader::LanceArrowToDorisBlockTimeProfile, false);
+    update_profile_info_key(RowIdStorageReader::LanceRowIdFetchTotalTimeProfile, false);
+    for (const auto& [name, unit] : RowIdStorageReader::LanceFetchCountersProfile) {
+        update_profile_info_key(name, false);
+    }
 }
 
 Status MaterializationSharedState::create_muiltget_result(const Columns& columns, bool child_eos) {
@@ -222,19 +514,28 @@ Status MaterializationSharedState::create_muiltget_result(const Columns& columns
 
         for (int j = 0; j < rows; ++j) {
             if (!null_map || !null_map[j]) {
-                DCHECK(column_rowid->get_data_at(j).size == sizeof(GlobalRowLoacationV2));
-                GlobalRowLoacationV2 row_location =
-                        *((GlobalRowLoacationV2*)column_rowid->get_data_at(j).data);
+                MaterializationRowLocation row_location;
+                RETURN_IF_ERROR(decode_materialization_row_location(column_rowid->get_data_at(j),
+                                                                    &row_location));
                 auto rpc_struct = rpc_struct_map.find(row_location.backend_id);
                 if (UNLIKELY(rpc_struct == rpc_struct_map.end())) {
                     return Status::InternalError(
                             "MaterializationSinkOperatorX failed to find rpc_struct, backend_id={}",
                             row_location.backend_id);
                 }
-                rpc_struct->second.request.mutable_request_block_descs(i)->add_row_id(
-                        row_location.row_id);
-                rpc_struct->second.request.mutable_request_block_descs(i)->add_file_id(
-                        row_location.file_id);
+                auto* request_block_desc =
+                        rpc_struct->second.request.mutable_request_block_descs(i);
+                const auto row_location_version = static_cast<uint32_t>(row_location.version);
+                if (request_block_desc->row_id_size() == 0) {
+                    request_block_desc->set_row_location_version(row_location_version);
+                } else if (request_block_desc->row_location_version() != row_location_version) {
+                    return Status::InternalError(
+                            "mixed row location versions in one materialization request: "
+                            "actual={}, expected={}",
+                            row_location_version, request_block_desc->row_location_version());
+                }
+                request_block_desc->add_row_id(row_location.row_id);
+                request_block_desc->add_file_id(row_location.file_id);
                 block_order[j] = row_location.backend_id;
 
                 // Count rows per backend
@@ -265,6 +566,9 @@ Status MaterializationSharedState::init_multi_requests(
     // Initialize the base struct of PMultiGetRequestV2
     multi_get_request.set_be_exec_version(state->be_exec_version());
     multi_get_request.set_wg_id(state->get_query_ctx()->workload_group()->id());
+    multi_get_request.set_file_cache_remote_only_on_miss(
+            config::is_cloud_mode() &&
+            state->query_options().enable_topn_lazy_mat_phase2_no_write_file_cache);
     auto* query_id = multi_get_request.mutable_query_id();
     query_id->set_hi(state->query_id().hi);
     query_id->set_lo(state->query_id().lo);
@@ -315,7 +619,10 @@ Status MaterializationSharedState::init_multi_requests(
                                FetchRpcStruct {.stub = std::move(client),
                                                .cntl = std::make_unique<brpc::Controller>(),
                                                .request = multi_get_request,
-                                               .response = PMultiGetResponseV2()});
+                                               .response = PMultiGetResponseV2(),
+                                               .backend_address = fmt::format(
+                                                       "id={} {}:{}", node_info.id, node_info.host,
+                                                       node_info.async_internal_port)});
     }
 
     return Status::OK();
@@ -333,7 +640,8 @@ Status MaterializationOperator::init(const doris::TPlanNode& tnode, doris::Runti
 
 Status MaterializationOperator::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(Base::prepare(state));
-    RETURN_IF_ERROR(VExpr::prepare(_rowid_exprs, state, _child->row_desc()));
+    RETURN_IF_ERROR(
+            VExpr::prepare(_rowid_exprs, state, _child->operator_row_desc_after_projection()));
     RETURN_IF_ERROR(VExpr::open(_rowid_exprs, state));
     return Status::OK();
 }
@@ -357,8 +665,7 @@ Status MaterializationOperator::pull(RuntimeState* state, Block* output_block, b
              local_state._materialization_state.backend_profile_info_string) {
             auto* child_profile = local_state.operator_profile()->create_child(
                     "RowIDFetcher: BackendId:" + std::to_string(backend_id));
-            for (const auto& [info_key, info_value] :
-                 local_state._materialization_state.backend_profile_info_string[backend_id]) {
+            for (const auto& [info_key, info_value] : child_info) {
                 child_profile->add_info_string(info_key, "{" + fmt::to_string(info_value) + "}");
             }
             local_state.operator_profile()->add_child(child_profile, true);
@@ -370,7 +677,8 @@ Status MaterializationOperator::pull(RuntimeState* state, Block* output_block, b
 
 Status MaterializationOperator::push(RuntimeState* state, Block* in_block, bool eos) const {
     auto& local_state = get_local_state(state);
-    SCOPED_TIMER(local_state.exec_time_counter());
+    // StatefulOperatorX::get_block_impl already times push() with this counter.
+    // Nesting the same timer counts the synchronous row-fetch RPC wait twice.
     if (!local_state._materialization_state.rpc_struct_inited) {
         RETURN_IF_ERROR(local_state._materialization_state.init_multi_requests(
                 _materialization_node, state));
@@ -398,6 +706,9 @@ Status MaterializationOperator::push(RuntimeState* state, Block* in_block, bool 
         MonotonicStopWatch rpc_timer(true);
         for (auto& [backend_id, rpc_struct] : local_state._materialization_state.rpc_struct_map) {
             auto* callback = brpc::NewCallback(fetch_callback, &counter);
+            // The response object is reused across batches. Clear it so an ignored failure for
+            // an empty request cannot expose a response left by an earlier batch.
+            rpc_struct.response.Clear();
             rpc_struct.cntl->set_timeout_ms(state->execution_timeout() * 1000);
             // send brpc request
             rpc_struct.stub->multiget_data_v2(rpc_struct.cntl.get(), &rpc_struct.request,
@@ -408,26 +719,12 @@ Status MaterializationOperator::push(RuntimeState* state, Block* in_block, bool 
             local_state._max_rpc_timer->set(time);
         }
 
-        for (auto& [backend_id, rpc_struct] : local_state._materialization_state.rpc_struct_map) {
-            if (rpc_struct.cntl->Failed()) {
-                std::string error_text =
-                        "Failed to send brpc request, error_text=" + rpc_struct.cntl->ErrorText() +
-                        " Materialization Sink node id:" + std::to_string(node_id()) +
-                        " target_backend_id:" + std::to_string(backend_id);
-                return Status::InternalError(error_text);
-            }
-            if (rpc_struct.response.status().status_code() != 0) {
-                Status st = Status::create(rpc_struct.response.status());
-                st.append(fmt::format(", Backend:{}, Materialization Sink node id:{}", backend_id,
-                                      node_id()));
-                return st;
-            }
-            rpc_struct.cntl->Reset();
-        }
+        RETURN_IF_ERROR(local_state._materialization_state.validate_rpc_results(node_id()));
 
         if (local_state._materialization_state.need_merge_block) {
             SCOPED_TIMER(local_state._merge_response_timer);
-            RETURN_IF_ERROR(local_state._materialization_state.merge_multi_response());
+            RETURN_IF_ERROR(local_state._materialization_state.merge_multi_response(
+                    local_state.operator_profile()));
             local_state._max_rows_per_backend_counter->set(
                     (int64_t)local_state._materialization_state._max_rows_per_backend);
         }

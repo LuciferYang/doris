@@ -19,15 +19,19 @@ package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.analysis.TableScanParams;
 import org.apache.doris.analysis.TableSnapshot;
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.PartitionItem;
 import org.apache.doris.common.IdGenerator;
+import org.apache.doris.connector.spi.handle.ConnectorTableHandle;
+import org.apache.doris.connector.spi.pushdown.ConnectorExpression;
+import org.apache.doris.connector.spi.pushdown.FilterApplicationResult;
 import org.apache.doris.datasource.ExternalTable;
-import org.apache.doris.datasource.hive.HMSExternalTable;
-import org.apache.doris.datasource.iceberg.IcebergExternalTable;
-import org.apache.doris.datasource.iceberg.IcebergSysExternalTable;
 import org.apache.doris.datasource.mvcc.MvccUtil;
+import org.apache.doris.datasource.plugin.PluginDrivenExternalTable;
+import org.apache.doris.datasource.plugin.PluginDrivenSysExternalTable;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
+import org.apache.doris.nereids.rules.expression.rules.SortedPartitionRanges;
 import org.apache.doris.nereids.trees.TableSample;
 import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
@@ -40,9 +44,6 @@ import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
-import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.qe.SessionVariable;
-import org.apache.doris.thrift.TFileFormatType;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -64,6 +65,9 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
     protected final Optional<TableSnapshot> tableSnapshot;
     protected final Optional<TableScanParams> scanParams;
     protected final Optional<List<Slot>> cachedOutputs;
+    // Collection preloads this reference before locking. CTE copies have fresh relation/ExprIds but
+    // must still consume the same prepared view, without repeating connector IO under internal locks.
+    private final RelationId preloadRelationId;
 
     /**
      * Constructor for LogicalFileScan.
@@ -73,7 +77,10 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
             Optional<TableSample> tableSample, Optional<TableSnapshot> tableSnapshot,
             Optional<TableScanParams> scanParams, Optional<List<Slot>> cachedOutputs) {
         this(id, table, qualifier,
-                table.initSelectedPartitions(MvccUtil.getSnapshotFromContext(table)),
+                // This reference's OWN version, not the ambient one: the selectors are right here as ctor
+                // params, and the blind lookup degrades to LATEST once the table is pinned at two versions.
+                table.initSelectedPartitions(
+                        MvccUtil.getSnapshotFromContext(table, tableSnapshot, scanParams)),
                 operativeSlots, ImmutableList.of(),
                 tableSample, tableSnapshot,
                 scanParams, Optional.empty(), Optional.empty(), "",
@@ -89,8 +96,19 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
             Optional<TableSnapshot> tableSnapshot, Optional<TableScanParams> scanParams,
             Optional<GroupExpression> groupExpression, Optional<LogicalProperties> logicalProperties,
             String tableAlias, Optional<List<Slot>> cachedSlots) {
+        this(id, table, qualifier, selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
+                scanParams, groupExpression, logicalProperties, tableAlias, cachedSlots, id);
+    }
+
+    private LogicalFileScan(RelationId id, ExternalTable table, List<String> qualifier,
+            SelectedPartitions selectedPartitions, Collection<Slot> operativeSlots,
+            List<NamedExpression> virtualColumns, Optional<TableSample> tableSample,
+            Optional<TableSnapshot> tableSnapshot, Optional<TableScanParams> scanParams,
+            Optional<GroupExpression> groupExpression, Optional<LogicalProperties> logicalProperties,
+            String tableAlias, Optional<List<Slot>> cachedSlots, RelationId preloadRelationId) {
         super(id, PlanType.LOGICAL_FILE_SCAN, table, qualifier, operativeSlots, virtualColumns,
                 groupExpression, logicalProperties, tableAlias);
+        this.preloadRelationId = preloadRelationId;
         this.selectedPartitions = selectedPartitions;
         this.tableSample = tableSample;
         this.tableSnapshot = tableSnapshot;
@@ -106,6 +124,10 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
             Optional<List<Slot>> cachedOutputs) {
         this(id, table, qualifier, selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
                 scanParams, groupExpression, logicalProperties, "", cachedOutputs);
+    }
+
+    public RelationId getPreloadRelationId() {
+        return preloadRelationId;
     }
 
     public SelectedPartitions getSelectedPartitions() {
@@ -151,7 +173,7 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
                 new LogicalFileScan(relationId, (ExternalTable) table, qualifier,
                 selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
                 scanParams, groupExpression, Optional.of(getLogicalProperties()), tableAlias,
-                cachedOutputs));
+                cachedOutputs, preloadRelationId));
     }
 
     @Override
@@ -160,7 +182,7 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
         return AbstractPlan.copyWithSameId(this, () ->
                 new LogicalFileScan(relationId, (ExternalTable) table, qualifier,
                 selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
-                scanParams, groupExpression, logicalProperties, tableAlias, cachedOutputs));
+                scanParams, groupExpression, logicalProperties, tableAlias, cachedOutputs, preloadRelationId));
     }
 
     public LogicalFileScan withSelectedPartitions(SelectedPartitions selectedPartitions) {
@@ -168,7 +190,17 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
                 new LogicalFileScan(relationId, (ExternalTable) table, qualifier,
                 selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
                 scanParams, Optional.empty(), Optional.of(getLogicalProperties()), tableAlias,
-                cachedOutputs));
+                cachedOutputs, preloadRelationId));
+    }
+
+    /**
+     * Return a new scan with the specified partition pruning state.
+     */
+    public LogicalFileScan withPartitionPruned(boolean isPruned) {
+        if (selectedPartitions.isNativePlanning() || selectedPartitions.isPruned == isPruned) {
+            return this;
+        }
+        return withSelectedPartitions(selectedPartitions.withPruned(isPruned));
     }
 
     @Override
@@ -176,7 +208,7 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
         return AbstractPlan.copyWithSameId(this, () ->
                 new LogicalFileScan(relationId, (ExternalTable) table, qualifier,
                 selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
-                scanParams, Optional.empty(), Optional.empty(), tableAlias, cachedOutputs));
+                scanParams, Optional.empty(), Optional.empty(), tableAlias, cachedOutputs, preloadRelationId));
     }
 
     public LogicalFileScan withTableAlias(String tableAlias) {
@@ -184,7 +216,7 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
                 new LogicalFileScan(relationId, (ExternalTable) table, qualifier,
                 selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
                 scanParams, Optional.empty(), Optional.of(getLogicalProperties()), tableAlias,
-                cachedOutputs));
+                cachedOutputs, preloadRelationId));
     }
 
     @Override
@@ -198,31 +230,64 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
     }
 
     @Override
+    protected boolean hasSameScanState(LogicalCatalogRelation other) {
+        if (!Utils.isSameClass(this, other)) {
+            return false;
+        }
+        LogicalFileScan that = (LogicalFileScan) other;
+        return Objects.equals(selectedPartitions, that.selectedPartitions)
+                && Objects.equals(tableSample, that.tableSample)
+                && hasSameSnapshot(tableSnapshot, that.tableSnapshot)
+                && hasSameScanParams(scanParams, that.scanParams);
+    }
+
+    @Override
     public List<Slot> computeOutput() {
         if (cachedOutputs.isPresent()) {
             return cachedOutputs.get();
         }
 
-        if (table instanceof IcebergExternalTable) {
-            // iceberg v3 need append row lineage columns
-            return computeIcebergOutput((IcebergExternalTable) table);
-        } else {
-            return super.computeOutput();
+        if (table instanceof PluginDrivenExternalTable) {
+            // SPI-driven tables: schema is fetched via ConnectorMetadata.getTableSchema()
+            // (see PluginDrivenExternalTable.initSchema). Use getFullSchema() so any
+            // hidden/metadata columns the connector exposes are reachable.
+            return computePluginDrivenOutput();
         }
+        return super.computeOutput();
     }
 
-    private List<Slot> computeIcebergOutput(IcebergExternalTable iceTable) {
+    private List<Slot> computePluginDrivenOutput() {
         IdGenerator<ExprId> exprIdGenerator = StatementScopeIdGenerator.getExprIdGenerator();
         Builder<Slot> slots = ImmutableList.builder();
-        table.getFullSchema()
+        pluginDrivenSchemaAtThisVersion()
                 .stream()
                 .map(col -> SlotReference.fromColumn(exprIdGenerator.getNextId(), table, col, qualified()))
                 .forEach(slots::add);
-        // add virtual slots
         for (NamedExpression virtualColumn : virtualColumns) {
             slots.add(virtualColumn.toSlot());
         }
         return slots.build();
+    }
+
+    /**
+     * The plugin table's schema AS OF THIS reference's own version. {@code tableSnapshot}/{@code scanParams}
+     * are final fields set in the ctor, so they are available even though {@code computeOutput()} is
+     * evaluated lazily ({@code AbstractPlan.logicalPropertiesSupplier}) -- and the version-aware lookup is
+     * key-exact, so the answer does not depend on how many versions the statement pins or on when this runs.
+     * The version-BLIND {@code getFullSchema()} would degrade to LATEST once this table is pinned at two
+     * versions (e.g. {@code t@tag(a) JOIN t@tag(b)}), binding a schema NO reference asked for and making the
+     * scan-time guard fire on a column the query never referenced.
+     */
+    private List<Column> pluginDrivenSchemaAtThisVersion() {
+        if (table instanceof PluginDrivenSysExternalTable) {
+            // A SYSTEM table resolves its own pin: it is not an MvccTable, and BindRelation returns from
+            // handleMetaTable BEFORE loadSnapshots, so the context lookup is empty by construction and the
+            // schema would silently degrade to LATEST -- binding a since-renamed column as missing and a
+            // since-retyped one at the WRONG TYPE, while the scan reads the pinned snapshot. The pin is
+            // resolved off the SOURCE table and memoized there, so this and the scan node share one answer.
+            return ((PluginDrivenSysExternalTable) table).getFullSchemaAt(tableSnapshot, scanParams);
+        }
+        return getTable().getFullSchema(MvccUtil.getSnapshotFromContext(table, tableSnapshot, scanParams));
     }
 
     @Override
@@ -233,31 +298,32 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
     @Override
     public boolean supportPruneNestedColumn() {
         ExternalTable table = getTable();
-        if (table instanceof IcebergExternalTable || table instanceof IcebergSysExternalTable) {
-            return true;
-        } else if (table instanceof HMSExternalTable) {
-            HMSExternalTable hmsTable = (HMSExternalTable) table;
-            if (hmsTable.getDlaType() == HMSExternalTable.DLAType.HUDI) {
-                // Don't prune nested column for HUDI table for now, because HUDI table
-                // may have some issues when pruning nested column.
-                return false;
-            }
-            try {
-                ConnectContext connectContext = ConnectContext.get();
-                SessionVariable sessionVariable = connectContext.getSessionVariable();
-                TFileFormatType fileFormatType = ((HMSExternalTable) table).getFileFormatType(sessionVariable);
-                switch (fileFormatType) {
-                    case FORMAT_PARQUET:
-                    case FORMAT_ORC:
-                        return true;
-                    default:
-                        return false;
-                }
-            } catch (Throwable t) {
-                // ignore and not prune
-            }
+        if (table instanceof PluginDrivenExternalTable) {
+            // Post-flip plugin-driven tables (e.g. iceberg as PluginDrivenMvccExternalTable) declare
+            // nested-column prune via ConnectorCapability; the legacy exact-class IcebergExternalTable arm
+            // below is dead for them. Field ids are NOT required here: a connector addressed by name
+            // (paimon, fluss) declares SUPPORTS_NESTED_COLUMN_PRUNE alone, and only the separate
+            // SUPPORTS_FIELD_ID_ACCESS_PATH lets SlotTypeReplacer rewrite the paths to ids.
+            return ((PluginDrivenExternalTable) table).supportsNestedColumnPrune();
         }
         return false;
+    }
+
+    private boolean hasSameSnapshot(Optional<TableSnapshot> left, Optional<TableSnapshot> right) {
+        if (!left.isPresent() || !right.isPresent()) {
+            return left.isPresent() == right.isPresent();
+        }
+        return left.get().getType() == right.get().getType()
+                && Objects.equals(left.get().getValue(), right.get().getValue());
+    }
+
+    private boolean hasSameScanParams(Optional<TableScanParams> left, Optional<TableScanParams> right) {
+        if (!left.isPresent() || !right.isPresent()) {
+            return left.isPresent() == right.isPresent();
+        }
+        return Objects.equals(left.get().getParamType(), right.get().getParamType())
+                && Objects.equals(left.get().getMapParams(), right.get().getMapParams())
+                && Objects.equals(left.get().getListParams(), right.get().getListParams());
     }
 
     /**
@@ -265,10 +331,29 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
      * Mainly for hive table partition pruning.
      */
     public static class SelectedPartitions {
+        /** Materialization state for the partition selection. */
+        public enum State {
+            NOT_PRUNED,
+            DEFERRED,
+            MATERIALIZED,
+            NATIVE
+        }
+
+        public static final long UNKNOWN_TOTAL_PARTITION_NUM = -1L;
+
         // NOT_PRUNED means the Nereids planner does not handle the partition pruning.
         // This can be treated as the initial value of SelectedPartitions.
         // Or used to indicate that the partition pruning is not processed.
-        public static SelectedPartitions NOT_PRUNED = new SelectedPartitions(0, ImmutableMap.of(), false, false);
+        public static SelectedPartitions NOT_PRUNED = new SelectedPartitions(0, ImmutableMap.of(), false, false,
+                Optional.empty(), State.NOT_PRUNED);
+        // DEFERRED_PARTITION_PRUNING means a connector will materialize the partition view after Nereids has
+        // supplied a predicate. It must stay distinct from NOT_PRUNED because PluginDrivenScanNode preserves
+        // batch split generation for a no-predicate full scan by materializing this state before dispatch.
+        public static SelectedPartitions DEFERRED_PARTITION_PRUNING = new SelectedPartitions(
+                UNKNOWN_TOTAL_PARTITION_NUM, ImmutableMap.of(), false, false, Optional.empty(), State.DEFERRED);
+        /** Connector-owned file planning; an unknown universe, never an empty pruned selection. */
+        public static final SelectedPartitions NATIVE = new SelectedPartitions(
+                UNKNOWN_TOTAL_PARTITION_NUM, ImmutableMap.of(), false, false, Optional.empty(), State.NATIVE);
         /**
          * total partition number
          */
@@ -289,11 +374,44 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
         public final boolean hasPartitionPredicate;
 
         /**
+         * sorted partition ranges for binary search filtering.
+         * Frozen at construction time to ensure consistency with selectedPartitions.
+         * Empty if binary search is not applicable (e.g., default partition only).
+         */
+        public final Optional<SortedPartitionRanges<String>> sortedPartitionRanges;
+
+        public final State state;
+
+        /**
+         * The connector filter application result the logical pruning rule obtained for this scan, carried so
+         * the physical scan reuses the SAME handle instead of applying the connector predicate a second time.
+         * Two applications can observe different remote generations, which would mix the selected partition
+         * names with another handle's partition metadata (the batched split path resolves those names through
+         * the handle's own pruned-partition map). Empty unless a connector materialized this view from a
+         * predicate.
+         *
+         * <p>Deliberately excluded from {@link #equals}/{@link #hashCode}: it is an execution detail of this
+         * scan, not part of the plan's semantic identity.</p>
+         */
+        public final Optional<FilterApplicationResult<ConnectorTableHandle>> connectorFilterResult;
+
+        /**
+         * The connector predicate represented by {@link #connectorFilterResult}. The physical scan may reuse
+         * the result only while its predicate set still equals this expression; a later compensation predicate
+         * must remain available for backend evaluation.
+         *
+         * <p>Deliberately excluded from {@link #equals}/{@link #hashCode}: it is an execution detail of this
+         * scan, not part of the plan's semantic identity.</p>
+         */
+        public final Optional<ConnectorExpression> coveredConnectorFilter;
+
+        /**
          * Constructor for SelectedPartitions.
          */
+
         public SelectedPartitions(long totalPartitionNum, Map<String, PartitionItem> selectedPartitions,
                 boolean isPruned) {
-            this(totalPartitionNum, selectedPartitions, isPruned, false);
+            this(totalPartitionNum, selectedPartitions, isPruned, false, Optional.empty());
         }
 
         /**
@@ -301,11 +419,99 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
          */
         public SelectedPartitions(long totalPartitionNum, Map<String, PartitionItem> selectedPartitions,
                 boolean isPruned, boolean hasPartitionPredicate) {
+            this(totalPartitionNum, selectedPartitions, isPruned, hasPartitionPredicate, Optional.empty());
+        }
+
+        /**
+         * Constructor for SelectedPartitions with sorted partition ranges.
+         */
+        public SelectedPartitions(long totalPartitionNum, Map<String, PartitionItem> selectedPartitions,
+                boolean isPruned, boolean hasPartitionPredicate,
+                Optional<SortedPartitionRanges<String>> sortedPartitionRanges) {
+            this(totalPartitionNum, selectedPartitions, isPruned, hasPartitionPredicate, sortedPartitionRanges,
+                    State.MATERIALIZED);
+        }
+
+        private SelectedPartitions(long totalPartitionNum, Map<String, PartitionItem> selectedPartitions,
+                boolean isPruned, boolean hasPartitionPredicate,
+                Optional<SortedPartitionRanges<String>> sortedPartitionRanges, State state) {
+            this(totalPartitionNum, selectedPartitions, isPruned, hasPartitionPredicate, sortedPartitionRanges,
+                    state, Optional.empty());
+        }
+
+        private SelectedPartitions(long totalPartitionNum, Map<String, PartitionItem> selectedPartitions,
+                boolean isPruned, boolean hasPartitionPredicate,
+                Optional<SortedPartitionRanges<String>> sortedPartitionRanges, State state,
+                Optional<FilterApplicationResult<ConnectorTableHandle>> connectorFilterResult) {
+            this(totalPartitionNum, selectedPartitions, isPruned, hasPartitionPredicate, sortedPartitionRanges,
+                    state, connectorFilterResult, Optional.empty());
+        }
+
+        private SelectedPartitions(long totalPartitionNum, Map<String, PartitionItem> selectedPartitions,
+                boolean isPruned, boolean hasPartitionPredicate,
+                Optional<SortedPartitionRanges<String>> sortedPartitionRanges, State state,
+                Optional<FilterApplicationResult<ConnectorTableHandle>> connectorFilterResult,
+                Optional<ConnectorExpression> coveredConnectorFilter) {
             this.totalPartitionNum = totalPartitionNum;
             this.selectedPartitions = ImmutableMap.copyOf(Objects.requireNonNull(selectedPartitions,
                     "selectedPartitions is null"));
             this.isPruned = isPruned;
             this.hasPartitionPredicate = hasPartitionPredicate;
+            this.sortedPartitionRanges = sortedPartitionRanges;
+            this.state = state;
+            this.connectorFilterResult = connectorFilterResult;
+            this.coveredConnectorFilter = coveredConnectorFilter;
+        }
+
+        /**
+         * A selection materialized from a connector-filtered partition view, carrying the filter result so the
+         * physical scan reuses the exact handle instead of applying the connector predicate again.
+         *
+         * <p>A named factory rather than a constructor: an {@code Optional<FilterApplicationResult<...>>}
+         * parameter would erase to the same signature as the {@code Optional<SortedPartitionRanges<String>>}
+         * constructor.</p>
+         */
+        public static SelectedPartitions connectorFiltered(long totalPartitionNum,
+                Map<String, PartitionItem> selectedPartitions, boolean hasPartitionPredicate,
+                FilterApplicationResult<ConnectorTableHandle> connectorFilterResult,
+                ConnectorExpression coveredConnectorFilter) {
+            return new SelectedPartitions(totalPartitionNum, selectedPartitions, true, hasPartitionPredicate,
+                    Optional.empty(), State.MATERIALIZED, Optional.of(connectorFilterResult),
+                    Optional.of(coveredConnectorFilter));
+        }
+
+        /** The connector filter result this selection was materialized from, or empty. */
+        public Optional<FilterApplicationResult<ConnectorTableHandle>> getConnectorFilterResult() {
+            return connectorFilterResult;
+        }
+
+        /** The connector predicate covered by {@link #connectorFilterResult}, or empty. */
+        public Optional<ConnectorExpression> getCoveredConnectorFilter() {
+            return coveredConnectorFilter;
+        }
+
+        public boolean isNotPruned() {
+            return state == State.NOT_PRUNED;
+        }
+
+        public boolean isDeferredPartitionPruning() {
+            return state == State.DEFERRED;
+        }
+
+        public boolean isNativePlanning() {
+            return state == State.NATIVE;
+        }
+
+        /**
+         * Return a copy with the specified partition pruning state.
+         */
+        public SelectedPartitions withPruned(boolean isPruned) {
+            if (isNativePlanning() || this.isPruned == isPruned) {
+                return this;
+            }
+            return new SelectedPartitions(totalPartitionNum, selectedPartitions, isPruned,
+                    hasPartitionPredicate, sortedPartitionRanges, state,
+                    connectorFilterResult, coveredConnectorFilter);
         }
 
         @Override
@@ -317,15 +523,18 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
                 return false;
             }
             SelectedPartitions that = (SelectedPartitions) o;
-            return isPruned == that.isPruned
+            return state == that.state && isPruned == that.isPruned
                     && hasPartitionPredicate == that.hasPartitionPredicate
                     && Objects.equals(
-                    selectedPartitions.keySet(), that.selectedPartitions.keySet());
+                    selectedPartitions.keySet(), that.selectedPartitions.keySet())
+                    && Objects.equals(
+                    sortedPartitionRanges.isPresent(), that.sortedPartitionRanges.isPresent());
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(selectedPartitions, isPruned, hasPartitionPredicate);
+            return Objects.hash(selectedPartitions, isPruned, hasPartitionPredicate,
+                    sortedPartitionRanges.isPresent(), state);
         }
     }
 
@@ -334,14 +543,16 @@ public class LogicalFileScan extends LogicalCatalogRelation implements SupportPr
         return AbstractPlan.copyWithSameId(this, () ->
                 new LogicalFileScan(relationId, (ExternalTable) table, qualifier,
                 selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
-                scanParams, groupExpression, Optional.of(getLogicalProperties()), tableAlias, cachedOutputs));
+                scanParams, groupExpression, Optional.of(getLogicalProperties()), tableAlias,
+                cachedOutputs, preloadRelationId));
     }
 
     public LogicalFileScan withCachedOutput(List<Slot> cachedOutputs) {
         return AbstractPlan.copyWithSameId(this, () ->
                 new LogicalFileScan(relationId, (ExternalTable) table, qualifier,
                 selectedPartitions, operativeSlots, virtualColumns, tableSample, tableSnapshot,
-                scanParams, groupExpression, Optional.empty(), tableAlias, Optional.of(cachedOutputs)));
+                scanParams, groupExpression, Optional.empty(), tableAlias,
+                Optional.of(cachedOutputs), preloadRelationId));
     }
 
     @Override

@@ -25,9 +25,15 @@
 #include <chrono>
 #include <thread>
 
+#include "agent/agent_server.h"
+#include "cloud/cloud_storage_engine.h"
+#include "common/config.h"
 #include "runtime/cluster_info.h"
+#include "runtime/exec_env.h"
 #include "storage/options.h"
 #include "storage/storage_engine.h"
+#include "util/defer_op.h"
+#include "util/threadpool.h"
 
 namespace doris {
 
@@ -102,6 +108,41 @@ TEST(TaskWorkerPoolTest, PreSubmitCallbackWithDedup) {
     workers.stop();
     EXPECT_EQ(callback_count.load(), 1);
 }
+
+class CloudCommittedRowsetTaskTest : public testing::TestWithParam<bool> {};
+
+TEST_P(CloudCommittedRowsetTaskTest, ReleasesSignatureAfterCallback) {
+    const bool original_enabled = config::enable_cloud_make_rs_visible_on_be;
+    Defer restore_config = [&] { config::enable_cloud_make_rs_visible_on_be = original_enabled; };
+    config::enable_cloud_make_rs_visible_on_be = GetParam();
+
+    CloudStorageEngine engine(EngineOptions {});
+    std::atomic_int callback_count {0};
+    TaskWorkerPool workers("make_cloud_committed_rs_visible_test", 1, [&](const auto& task) {
+        make_cloud_committed_rs_visible_callback(engine, task);
+        ++callback_count;
+    });
+
+    TAgentTaskRequest task;
+    task.__set_task_type(TTaskType::MAKE_CLOUD_COMMITTED_RS_VISIBLE);
+    task.__set_signature(GetParam() ? 5975401 : 5975400);
+    task.make_cloud_tmp_rs_visible_req.__set_txn_id(task.signature);
+    // A tablet absent from the local cache is skipped without fetching metadata from MS.
+    task.make_cloud_tmp_rs_visible_req.__set_tablet_ids({59754});
+
+    ASSERT_TRUE(workers.submit_task(task).ok());
+    workers._thread_pool->wait();
+    ASSERT_EQ(callback_count.load(), 1);
+
+    // A completed notification must not suppress a later task with the same signature,
+    // including when the feature was disabled before the first callback ran.
+    ASSERT_TRUE(workers.submit_task(task).ok());
+    workers._thread_pool->wait();
+    EXPECT_EQ(callback_count.load(), 2);
+}
+
+INSTANTIATE_TEST_SUITE_P(EnabledAndDisabled, CloudCommittedRowsetTaskTest,
+                         testing::Values(true, false));
 
 TEST(TaskWorkerPoolTest, PriorTaskWorkerPool) {
     std::atomic_int normal_count {0};
@@ -179,6 +220,21 @@ TEST(TaskWorkerPoolTest, ReportWorkerPool) {
     worker.notify(); // Ignore
     std::this_thread::sleep_for(100ms);
     EXPECT_EQ(count.load(), 3);
+}
+
+TEST(AgentServerTest, CloudRegistersCleanUdfCacheWorker) {
+    auto* exec_env = ExecEnv::GetInstance();
+    auto engine = std::make_unique<CloudStorageEngine>(EngineOptions {});
+    auto* cloud_engine = engine.get();
+    exec_env->set_storage_engine(std::move(engine));
+    Defer defer {[exec_env] { exec_env->set_storage_engine(nullptr); }};
+
+    ClusterInfo cluster_info;
+    AgentServer agent_server(exec_env, &cluster_info);
+
+    agent_server.cloud_start_workers(*cloud_engine, exec_env);
+
+    EXPECT_TRUE(agent_server._workers.contains(TTaskType::CLEAN_UDF_CACHE));
 }
 
 } // namespace doris

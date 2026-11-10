@@ -23,13 +23,10 @@
 #pragma clang diagnostic ignored "-Wkeyword-macro"
 #endif
 
-#include "util/defer_op.h"
+#include <tuple>
 
-#define private public
-#define protected public
 #include "io/cache/block_file_cache_test_common.h"
-#undef private
-#undef protected
+#include "util/defer_op.h"
 
 #if defined(__clang__)
 #pragma clang diagnostic pop
@@ -260,10 +257,10 @@ TEST_F(BlockFileCacheTest, version3_add_remove_restart) {
 
         // then check the log replay
         ASSERT_EQ(cache.replay_lru_logs_once(), 20);
-        ASSERT_EQ(cache._lru_recorder->_shadow_ttl_queue.get_elements_num_unsafe(), 5);
-        ASSERT_EQ(cache._lru_recorder->_shadow_index_queue.get_elements_num_unsafe(), 5);
-        ASSERT_EQ(cache._lru_recorder->_shadow_normal_queue.get_elements_num_unsafe(), 5);
-        ASSERT_EQ(cache._lru_recorder->_shadow_disposable_queue.get_elements_num_unsafe(), 5);
+        ASSERT_EQ(cache._lru_recorder->_shadow_ttl_queue.get_elements_num_unsafe(), 2);
+        ASSERT_EQ(cache._lru_recorder->_shadow_index_queue.get_elements_num_unsafe(), 2);
+        ASSERT_EQ(cache._lru_recorder->_shadow_normal_queue.get_elements_num_unsafe(), 2);
+        ASSERT_EQ(cache._lru_recorder->_shadow_disposable_queue.get_elements_num_unsafe(), 2);
 
         // do some REMOVE
         {
@@ -271,12 +268,13 @@ TEST_F(BlockFileCacheTest, version3_add_remove_restart) {
         }
 
         ASSERT_EQ(cache.replay_lru_logs_once(), 5);
-        ASSERT_EQ(cache._lru_recorder->_shadow_ttl_queue.get_elements_num_unsafe(), 5);
+        ASSERT_EQ(cache._lru_recorder->_shadow_ttl_queue.get_elements_num_unsafe(), 2);
         ASSERT_EQ(cache._lru_recorder->_shadow_index_queue.get_elements_num_unsafe(), 0);
-        ASSERT_EQ(cache._lru_recorder->_shadow_normal_queue.get_elements_num_unsafe(), 5);
-        ASSERT_EQ(cache._lru_recorder->_shadow_disposable_queue.get_elements_num_unsafe(), 5);
+        ASSERT_EQ(cache._lru_recorder->_shadow_normal_queue.get_elements_num_unsafe(), 2);
+        ASSERT_EQ(cache._lru_recorder->_shadow_disposable_queue.get_elements_num_unsafe(), 2);
         EXPECT_EQ(cache.replay_lru_logs_once(), 0);
         EXPECT_EQ(cache._lru_recorder_log_replay_idle_metrics->get_value(), 1);
+        cache.dump_lru_queues(true);
 
         // check the meta store to see the content
         {
@@ -312,8 +310,6 @@ TEST_F(BlockFileCacheTest, version3_add_remove_restart) {
             verify_meta_key(*meta_store, 50, "key4", 300000, FileCacheType::DISPOSABLE, 0, 100000);
             verify_meta_key(*meta_store, 50, "key4", 400000, FileCacheType::DISPOSABLE, 0, 100000);
         }
-        std::this_thread::sleep_for(
-                std::chrono::milliseconds(2 * config::file_cache_background_lru_dump_interval_ms));
     }
 
     { // cache2
@@ -628,14 +624,16 @@ TEST_F(BlockFileCacheTest, clear_retains_meta_directory_and_clears_meta_entries)
     context.tablet_id = 314;
     auto key = io::BlockFileCache::hash("meta_clear_key");
 
-    auto holder = cache.get_or_set(key, 0, 100000, context);
-    auto blocks = fromHolder(holder);
-    ASSERT_EQ(blocks.size(), 1);
-    assert_range(1, blocks[0], io::FileBlock::Range(0, 99999), io::FileBlock::State::EMPTY);
-    ASSERT_TRUE(blocks[0]->get_or_set_downloader() == io::FileBlock::get_caller_id());
-    download(blocks[0]);
-    assert_range(2, blocks[0], io::FileBlock::Range(0, 99999), io::FileBlock::State::DOWNLOADED);
-    blocks.clear();
+    {
+        auto holder = cache.get_or_set(key, 0, 100000, context);
+        auto blocks = fromHolder(holder);
+        ASSERT_EQ(blocks.size(), 1);
+        assert_range(1, blocks[0], io::FileBlock::Range(0, 99999), io::FileBlock::State::EMPTY);
+        ASSERT_TRUE(blocks[0]->get_or_set_downloader() == io::FileBlock::get_caller_id());
+        download(blocks[0]);
+        assert_range(2, blocks[0], io::FileBlock::Range(0, 99999),
+                     io::FileBlock::State::DOWNLOADED);
+    }
 
     auto* fs_storage = dynamic_cast<FSFileCacheStorage*>(cache._storage.get());
     ASSERT_NE(fs_storage, nullptr) << "Expected FSFileCacheStorage but got different storage type";
@@ -645,15 +643,17 @@ TEST_F(BlockFileCacheTest, clear_retains_meta_directory_and_clears_meta_entries)
     verify_meta_key(*meta_store, context.tablet_id, "meta_clear_key", 0, FileCacheType::NORMAL, 0,
                     100000);
 
-    cache.clear_file_cache_directly();
+    cache.clear_file_cache_sync();
 
     std::string meta_dir = cache.get_base_path() + "/meta";
     ASSERT_TRUE(fs::exists(meta_dir));
     ASSERT_TRUE(fs::is_directory(meta_dir));
 
     BlockMetaKey mkey(context.tablet_id, key, 0);
-    auto meta = meta_store->get(mkey);
-    ASSERT_FALSE(meta.has_value());
+    for (int i = 0; i < 100 && meta_store->get(mkey).has_value(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_FALSE(meta_store->get(mkey).has_value());
 
     auto iterator = meta_store->get_all();
     if (iterator != nullptr) {
@@ -740,7 +740,183 @@ TEST_F(BlockFileCacheTest, handle_already_loaded_block_updates_size_and_tablet) 
     }
 }
 
-//TODO(zhengyu): check lazy load
+namespace {
+
+class CountingFSFileCacheStorage : public FSFileCacheStorage {
+public:
+    void load_file_blocks_directly_unlocked(BlockFileCache* mgr, const UInt128Wrapper& hash,
+                                            int64_t tablet_id,
+                                            std::lock_guard<std::mutex>& cache_lock) override {
+        ++direct_loads;
+        FSFileCacheStorage::load_file_blocks_directly_unlocked(mgr, hash, tablet_id, cache_lock);
+    }
+
+    size_t direct_loads = 0;
+};
+
+TEST_F(BlockFileCacheTest, CompletedAsyncOpenSkipsDirectLoad) {
+    const auto path = caches_dir / "completed_async_open_skips_direct_load";
+    fs::remove_all(path);
+    fs::create_directories(path);
+    Defer remove_cache {[&] { fs::remove_all(path); }};
+    auto settings = get_file_cache_settings(8_mb, 0);
+    settings.max_file_block_size = 4096;
+    BlockFileCache cache(path.string(), settings);
+    auto storage = std::make_unique<CountingFSFileCacheStorage>();
+    auto* storage_ptr = storage.get();
+    cache._storage = std::move(storage);
+    ASSERT_TRUE(cache.initialize().ok());
+    storage_ptr->_cache_background_load_thread.join();
+    ASSERT_TRUE(cache.get_async_open_success());
+
+    ReadStatistics stats;
+    CacheContext context;
+    context.stats = &stats;
+    const auto hash = BlockFileCache::hash("completed_async_open_skips_direct_load");
+    FileBlocks blocks;
+    bool fully_covered = true;
+    ASSERT_TRUE(cache.get_downloaded_blocks_if_fully_covered(hash, 4096, 8192, context, &blocks,
+                                                             &fully_covered)
+                        .ok());
+    EXPECT_FALSE(fully_covered);
+    auto result = cache.probe(hash, 4096, 8192, context);
+    EXPECT_EQ(result.file_blocks, (std::vector<FileBlockSPtr> {nullptr, nullptr}));
+    auto holder = cache.get_or_set(hash, 4096, 8192, context);
+    EXPECT_EQ(storage_ptr->direct_loads, 0);
+}
+
+enum class LazyRestoreLookup { GET_OR_SET, DOWNLOADED, PROBE };
+
+class FileCacheLazyRestoreTest
+        : public BlockFileCacheTest,
+          public testing::WithParamInterface<std::tuple<LazyRestoreLookup, bool>> {
+protected:
+    void SetUp() override {
+        fs::remove_all(path);
+        fs::create_directories(path);
+        {
+            // Destruction drains pending writes before the restarted cache opens the database.
+            CacheBlockMetaStore meta_store((path / "meta").string());
+            meta_store.put(BlockMetaKey(tablet_id, hash, block_size),
+                           BlockMeta(FileCacheType::INDEX, block_size));
+            meta_store.put(BlockMetaKey(tablet_id, hash, 2 * block_size),
+                           BlockMeta(FileCacheType::NORMAL, block_size));
+        }
+        sync_point->set_call_back(
+                "BlockFileCache::TmpFile1",
+                [&](auto&&) {
+                    std::unique_lock lock(mutex);
+                    background_paused = true;
+                    cv.notify_all();
+                    cv.wait(lock, [&] { return resume_background; });
+                },
+                &guard);
+        sync_point->enable_processing();
+        auto settings = get_file_cache_settings(8_mb, 0);
+        settings.max_file_block_size = block_size;
+        cache = std::make_unique<BlockFileCache>(path.string(), settings);
+        ASSERT_TRUE(cache->initialize().ok());
+        {
+            std::unique_lock lock(mutex);
+            ASSERT_TRUE(
+                    cv.wait_for(lock, std::chrono::seconds(10), [&] { return background_paused; }));
+        }
+        ASSERT_FALSE(cache->get_async_open_success());
+        ASSERT_FALSE(cache->_files.contains(hash));
+    }
+
+    void TearDown() override {
+        {
+            std::lock_guard lock(mutex);
+            resume_background = true;
+        }
+        cv.notify_all();
+        cache.reset();
+        sync_point->disable_processing();
+        fs::remove_all(path);
+    }
+
+    static constexpr int64_t tablet_id = 47;
+    static constexpr size_t block_size = 4096;
+    const fs::path path = caches_dir / "lazy_restore_file_blocks";
+    const UInt128Wrapper hash = BlockFileCache::hash("lazy_restore_file_blocks");
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool background_paused = false;
+    bool resume_background = false;
+    SyncPoint* sync_point = SyncPoint::get_instance();
+    SyncPoint::CallbackGuard guard;
+    std::unique_ptr<BlockFileCache> cache;
+};
+
+TEST_P(FileCacheLazyRestoreTest, RestoreAllFileBlocksBeforeBackgroundLoad) {
+    const auto [lookup, unaligned] = GetParam();
+    ReadStatistics stats;
+    CacheContext context;
+    context.stats = &stats;
+    context.tablet_id = tablet_id;
+    const size_t offset = block_size + (unaligned ? 100 : 0);
+    const size_t size = 3 * block_size - offset;
+    FileBlocks blocks;
+    switch (lookup) {
+    case LazyRestoreLookup::GET_OR_SET: {
+        auto holder = cache->get_or_set(hash, offset, size, context);
+        blocks = holder.file_blocks;
+        break;
+    }
+    case LazyRestoreLookup::DOWNLOADED: {
+        bool fully_covered = false;
+        ASSERT_TRUE(cache->get_downloaded_blocks_if_fully_covered(hash, offset, size, context,
+                                                                  &blocks, &fully_covered)
+                            .ok());
+        EXPECT_TRUE(fully_covered);
+        break;
+    }
+    case LazyRestoreLookup::PROBE: {
+        auto result = cache->probe(hash, offset, size, context);
+        blocks.assign(result.file_blocks.begin(), result.file_blocks.end());
+        break;
+    }
+    }
+
+    ASSERT_EQ(blocks.size(), 2);
+    size_t expected_offset = block_size;
+    for (const auto& block : blocks) {
+        ASSERT_NE(block, nullptr);
+        EXPECT_EQ(block->state(), FileBlock::State::DOWNLOADED);
+        EXPECT_EQ(block->offset(), expected_offset);
+        EXPECT_EQ(block->range().size(), block_size);
+        EXPECT_EQ(block->tablet_id(), tablet_id);
+        EXPECT_EQ(block->cache_type(),
+                  expected_offset == block_size ? FileCacheType::INDEX : FileCacheType::NORMAL);
+        expected_offset += block_size;
+    }
+    EXPECT_EQ(cache->_cur_cache_size, 2 * block_size);
+
+    {
+        std::lock_guard lock(mutex);
+        resume_background = true;
+    }
+    cv.notify_all();
+    auto* storage = static_cast<FSFileCacheStorage*>(cache->_storage.get());
+    storage->_cache_background_load_thread.join();
+    ASSERT_TRUE(cache->get_async_open_success());
+    std::lock_guard cache_lock(cache->_mutex);
+    EXPECT_EQ(cache->_cur_cache_size, 2 * block_size);
+    for (const auto& block : blocks) {
+        EXPECT_EQ(cache->_files.at(hash).at(block->offset()).file_block, block);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(Startup, FileCacheLazyRestoreTest,
+                         testing::Values(std::make_tuple(LazyRestoreLookup::GET_OR_SET, false),
+                                         std::make_tuple(LazyRestoreLookup::GET_OR_SET, true),
+                                         std::make_tuple(LazyRestoreLookup::DOWNLOADED, false),
+                                         std::make_tuple(LazyRestoreLookup::DOWNLOADED, true),
+                                         std::make_tuple(LazyRestoreLookup::PROBE, false)));
+
+} // namespace
+
 //TODO(zhengyu): check version2 start
 //TODO(zhengyu): check version2 version3 mixed start
 

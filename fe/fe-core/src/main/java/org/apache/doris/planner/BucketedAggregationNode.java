@@ -40,12 +40,14 @@ import java.util.List;
 public class BucketedAggregationNode extends PlanNode {
     private final AggregateInfo aggInfo;
     private final boolean needsFinalize;
+    private final int numBuckets;
 
     public BucketedAggregationNode(PlanNodeId id, PlanNode input, AggregateInfo aggInfo,
-            boolean needsFinalize) {
+            boolean needsFinalize, int numBuckets) {
         super(id, aggInfo.getOutputTupleId().asList(), "BUCKETED AGGREGATE");
         this.aggInfo = aggInfo;
         this.needsFinalize = needsFinalize;
+        this.numBuckets = numBuckets;
         this.children.add(input);
     }
 
@@ -68,6 +70,7 @@ public class BucketedAggregationNode extends PlanNode {
         bucketedAggNode.setAggregateFunctions(aggregateFunctions);
         bucketedAggNode.setTupleId(aggInfo.getOutputTupleId().asInt());
         bucketedAggNode.setNeedFinalize(needsFinalize);
+        bucketedAggNode.setNumBuckets(numBuckets);
 
         msg.bucketed_agg_node = bucketedAggNode;
     }
@@ -76,6 +79,8 @@ public class BucketedAggregationNode extends PlanNode {
     public String getNodeExplainString(String detailPrefix, TExplainLevel detailLevel) {
         StringBuilder output = new StringBuilder();
         output.append(detailPrefix).append("BUCKETED").append("\n");
+        output.append(detailPrefix).append("buckets: ")
+                .append(numBuckets == 0 ? "auto" : Integer.toString(numBuckets)).append("\n");
 
         if (detailLevel == TExplainLevel.BRIEF) {
             output.append(detailPrefix).append(String.format("cardinality=%,d", cardinality)).append("\n");
@@ -97,9 +102,10 @@ public class BucketedAggregationNode extends PlanNode {
     }
 
     @Override
-    public boolean isSerialOperator() {
-        // Bucketed agg handles group-by keys only (no without-key in initial version),
-        // so it's never a serial operator.
+    public boolean isSerialNode() {
+        // Bucketed agg handles group-by keys only (no without-key in initial version), so it is never
+        // a serial operator. Overriding isSerialNode() (rather than isSerialOperatorOnBe) keeps it
+        // consistent with every other node; isSerialOperatorOnBe() derives from isSerialNode().
         return false;
     }
 }

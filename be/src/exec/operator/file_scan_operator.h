@@ -27,8 +27,12 @@
 #include "exec/scan/split_source_connector.h"
 #include "format/format_common.h"
 
+namespace doris::format::parquet {
+class ParquetProfileCache;
+}
+
 namespace doris {
-class FileScanner;
+class FileScannerV2;
 } // namespace doris
 
 namespace doris {
@@ -39,8 +43,8 @@ public:
     using Parent = FileScanOperatorX;
     using Base = ScanLocalState<FileScanLocalState>;
     ENABLE_FACTORY_CREATOR(FileScanLocalState);
-    FileScanLocalState(RuntimeState* state, OperatorXBase* parent)
-            : ScanLocalState<FileScanLocalState>(state, parent) {}
+    FileScanLocalState(RuntimeState* state, OperatorXBase* parent);
+    ~FileScanLocalState() override;
 
     Status init(RuntimeState* state, LocalStateInfo& info) override;
 
@@ -55,7 +59,7 @@ public:
     ScannerScheduler* scan_scheduler(RuntimeState* state) const override;
 
 private:
-    friend class FileScanner;
+    friend class FileScannerV2;
     PushDownType _should_push_down_bloom_filter() const override {
         return PushDownType::UNACCEPTABLE;
     }
@@ -77,13 +81,8 @@ private:
             VectorizedFnCall* fn_call, VExprContext* expr_ctx, Field& constant_val,
             const std::set<std::string> fn_name) const override;
     std::shared_ptr<SplitSourceConnector> _split_source = nullptr;
+    std::unique_ptr<format::parquet::ParquetProfileCache> _parquet_profile_cache;
     int _max_scanners;
-    // A in memory cache to save some common components
-    // of the this scan node. eg:
-    // 1. iceberg delete file
-    // 2. parquet file meta
-    // KVCache<std::string> _kv_cache;
-    std::unique_ptr<ShardedKVCache> _kv_cache;
     TupleId _output_tuple_id = -1;
 };
 
@@ -104,17 +103,6 @@ public:
         return _batch_split_mode ? 1 : ScanOperatorX<FileScanLocalState>::parallelism(state);
     }
 
-    int get_column_id(const std::string& col_name) const override {
-        int column_id_counter = 0;
-        for (const auto& slot : _output_tuple_desc->slots()) {
-            if (slot->col_name() == col_name) {
-                return column_id_counter;
-            }
-            column_id_counter++;
-        }
-        return column_id_counter;
-    }
-
     bool can_push_down_column_predicate(const SlotDescriptor* slot) const override;
 
 private:
@@ -122,6 +110,15 @@ private:
 
     const std::string _table_name;
     bool _batch_split_mode = false;
+    // What this scan node's readers parse once and reuse across splits: iceberg delete files,
+    // deletion vectors, the keys of a fluss union read's log tails. One cache for every instance of
+    // the node on this backend, so a split reuses what a split in another instance already read;
+    // splits are dealt to instances with no regard for which delete file or bucket they share.
+    std::unique_ptr<ShardedKVCache> _kv_cache;
 };
+
+/// Instantiated once in scan_operator.cpp; suppresses per-TU implicit instantiation.
+extern template class ScanOperatorX<FileScanLocalState>;
+extern template class ScanLocalState<FileScanLocalState>;
 
 } // namespace doris

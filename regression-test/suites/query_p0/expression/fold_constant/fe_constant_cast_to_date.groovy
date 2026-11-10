@@ -57,36 +57,36 @@ suite("fe_constant_cast_to_date") {
 
     test {
         sql """select cast("2023-07-16T19.123+08:00" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     qt_sql """select cast("2024/05/01" as date)"""
     test {
         sql """select cast("24012" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     test {
         sql """select cast("2411 123" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     test {
         sql """select cast("2024-05-01 01:030:02" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     test {
         sql """select cast("10000-01-01 00:00:00" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     test {
         sql """select cast("2024-0131T12:00" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     test {
         sql """select cast("2024-05-01@00:00" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     test {
         sql """select cast("20120212051" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     test {
         sql """select cast("2024-05-01T00:00XYZ" as date)"""
@@ -110,11 +110,11 @@ suite("fe_constant_cast_to_date") {
     }
     test {
         sql """select cast("2024-05-01T00:00+14:30" as date)"""
-        exception "Time zone offset couldn't be larger than 14:00"
+        exception "date/datetime literal [2024-05-01T00:00:00+14:30] is invalid"
     }
     test {
         sql """select cast("2024-05-01T00:00+08:25" as date)"""
-        exception "can't cast to DATETIMEV2"
+        exception "can't cast to DATEV2"
     }
     test {
         sql """select cast(1000 as date)"""

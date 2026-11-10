@@ -20,9 +20,9 @@
 
 #pragma once
 
-#include <gen_cpp/internal_service.pb.h>
-
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -31,9 +31,10 @@
 #include "common/status.h"
 #include "io/cache/block_file_cache.h"
 #include "io/cache/file_cache_common.h"
-#include "storage/options.h"
 namespace doris {
+class CacheBlockPB;
 class TUniqueId;
+struct CachePath;
 
 class Block;
 
@@ -48,6 +49,10 @@ public:
 
     Status create_file_cache(const std::string& cache_base_path,
                              FileCacheSettings file_cache_settings);
+
+    Status create_file_caches(
+            const std::vector<CachePath>& cache_paths,
+            const std::function<bool(const std::string&, const Status&)>& should_ignore_error);
 
     Status reload_file_cache(const std::vector<CachePath>& cache_base_paths);
 
@@ -85,6 +90,7 @@ public:
      * @return summary message
      */
     std::string clear_file_caches(bool sync);
+    Status clear_file_caches(bool sync, std::string* result);
 
     /**
      * dump lru queue info for all file cache instances
@@ -92,6 +98,15 @@ public:
     void dump_all_caches();
 
     std::vector<std::string> get_base_paths();
+
+    /// Re-read the BE-wide async-write settings, split the pending-byte ownership limit equally
+    /// across all initialized cache instances, and update every per-disk manager.
+    /// @return OK after every manager is updated; otherwise the first manager update error.
+    Status refresh_async_write_options();
+
+    /// Start async-write workers for every initialized cache disk. Repeated calls are idempotent.
+    /// @return OK after every manager is ready; otherwise the first startup error.
+    Status start_async_write_managers();
 
     /**
      * Clears data of all file cache instances
@@ -112,6 +127,8 @@ public:
     FileCacheFactory(const FileCacheFactory&) = delete;
 
 private:
+    Status _refresh_async_write_options_locked();
+
     std::mutex _mtx;
     std::vector<std::unique_ptr<BlockFileCache>> _caches;
     std::unordered_map<std::string, BlockFileCache*> _path_to_cache;

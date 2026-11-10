@@ -28,9 +28,11 @@
 #include "core/data_type/data_type_factory.hpp"
 #include "core/string_ref.h"
 #include "core/types.h"
+#include "exec/runtime_filter/runtime_filter_definitions.h"
 #include "exec/runtime_filter/utils.h"
 #include "exprs/create_predicate_function.h"
 #include "exprs/runtime_filter_expr.h"
+#include "exprs/vbloom_predicate.h"
 #include "exprs/vdirect_in_predicate.h"
 #include "exprs/vexpr.h"
 #include "exprs/vexpr_context.h"
@@ -161,7 +163,43 @@ protected:
         node.in_predicate.__set_is_not_in(false);
         node.__set_opcode(TExprOpcode::FILTER_IN);
         node.__set_is_nullable(false);
-        return VDirectInPredicate::create_shared(node, in_filter<PT>(value, contain_null));
+        return VDirectInPredicate::create_shared(node, in_filter<PT>(value, contain_null), true);
+    }
+
+    template <PrimitiveType PT>
+    VExprSPtr bloom_predicate(const std::vector<CppType<PT>>& values, bool contain_null = false) {
+        std::shared_ptr<BloomFilterFuncBase> filter(create_bloom_filter(PT, contain_null));
+        RuntimeFilterParams params;
+        params.filter_type = RuntimeFilterType::BLOOM_FILTER;
+        params.column_return_type = PT;
+        params.null_aware = contain_null;
+        params.bloom_filter_size = 1024;
+        filter->init_params(&params);
+        EXPECT_TRUE(filter->init_with_fixed_length(1024).ok());
+
+        using ColumnType = typename PrimitiveTypeTraits<PT>::ColumnType;
+        MutableColumnPtr values_column = ColumnType::create();
+        auto* typed_column = assert_cast<ColumnType*>(values_column.get());
+        for (const auto& value : values) {
+            typed_column->insert_value(value);
+        }
+        ColumnPtr values_column_ptr = std::move(values_column);
+        filter->insert_fixed_len(values_column_ptr, 0);
+
+        if (contain_null) {
+            std::shared_ptr<HybridSetBase> null_set(create_set(PT, contain_null));
+            null_set->insert(static_cast<const void*>(nullptr));
+            filter->insert_set(null_set);
+        }
+
+        TExprNode node;
+        node.__set_type(create_type_desc(PrimitiveType::TYPE_BOOLEAN));
+        node.__set_node_type(TExprNodeType::BLOOM_PRED);
+        node.__set_opcode(TExprOpcode::RT_FILTER);
+        node.__set_is_nullable(false);
+        auto bloom_pred = VBloomPredicate::create_shared(node);
+        bloom_pred->set_filter(filter);
+        return bloom_pred;
     }
 
     template <PrimitiveType PT>
@@ -226,6 +264,7 @@ protected:
         ASSERT_FALSE(parsed->empty());
         ASSERT_EQ(parsed->total_partitions(), 2);
         const auto& parsed_boundaries = parsed->slot_to_boundaries().at(SLOT_ID);
+        EXPECT_TRUE(parsed_boundaries[0].is_list_boundary);
 
         RuntimeFilterPartitionPruner in_pruner;
         phmap::flat_hash_set<int64_t> in_pruned;
@@ -247,6 +286,7 @@ protected:
         auto parsed_range = parse_boundaries(PT, range_boundaries, false, precision, scale);
         EXPECT_FALSE(parsed_range->empty());
         EXPECT_EQ(parsed_range->total_partitions(), 1);
+        EXPECT_FALSE(parsed_range->slot_to_boundaries().at(SLOT_ID)[0].is_list_boundary);
     }
 
     DateV2Value<DateV2ValueType> date_v2(uint16_t year, uint8_t month, uint8_t day) {
@@ -346,6 +386,8 @@ TEST_F(RuntimeFilterPartitionPrunerTest, ProjectedBoundariesSupportListValues) {
                         .ok());
     ASSERT_EQ(projected->size(), 2);
 
+    EXPECT_TRUE(projected->at(0).is_list_boundary);
+    EXPECT_TRUE(projected->at(1).is_list_boundary);
     const auto& first = std::get<ColumnValueRange<TYPE_INT>>(projected->at(0).boundary_cvr);
     EXPECT_TRUE(first.is_fixed_value_range());
     EXPECT_TRUE(first.get_fixed_value_set().contains(one));
@@ -359,6 +401,119 @@ TEST_F(RuntimeFilterPartitionPrunerTest, ProjectedBoundariesSupportListValues) {
     pruner._try_prune_by_single_rf(*projected, in_predicate<TYPE_INT>(two), pruned);
     EXPECT_FALSE(pruned.contains(1));
     EXPECT_TRUE(pruned.contains(2));
+}
+
+TEST_F(RuntimeFilterPartitionPrunerTest, ProjectedBoundariesSupportTimestampNs) {
+    const TimeStampNsValue lower(-1);
+    const TimeStampNsValue upper(1);
+    auto range_parsed =
+            parse_boundaries(TYPE_TIMESTAMP_NS,
+                             {range_boundary<TYPE_TIMESTAMP_NS>(
+                                     1, lower, upper, 0, TimeStampNsValue::FRACTIONAL_DIGITS)},
+                             false, 0, TimeStampNsValue::FRACTIONAL_DIGITS);
+    auto slot = slot_desc(TYPE_TIMESTAMP_NS, false, 0, TimeStampNsValue::FRACTIONAL_DIGITS);
+    auto target_expr = identity_wrapper_expr(slot.type());
+    VExprContext ctx(target_expr);
+    std::unordered_map<int64_t, TTargetExprMonotonicity::type> directions {
+            {1, TTargetExprMonotonicity::MONOTONIC_INCREASING}};
+
+    std::shared_ptr<const std::vector<ParsedBoundary>> projected_range;
+    ASSERT_TRUE(range_parsed
+                        ->get_or_compute_projected_boundaries(
+                                /*filter_id=*/301, target_expr, SLOT_ID,
+                                /*leaf_column_id=*/0, directions, &ctx, &projected_range)
+                        .ok());
+    ASSERT_EQ(projected_range->size(), 1);
+    const auto& range =
+            std::get<ColumnValueRange<TYPE_TIMESTAMP_NS>>(projected_range->at(0).boundary_cvr);
+    EXPECT_EQ(range.get_range_min_value(), lower);
+    EXPECT_EQ(range.get_range_max_value(), upper);
+
+    auto list_parsed = parse_boundaries(
+            TYPE_TIMESTAMP_NS,
+            {list_boundary<TYPE_TIMESTAMP_NS>(
+                    1,
+                    {literal_node<TYPE_TIMESTAMP_NS>(lower, 0, TimeStampNsValue::FRACTIONAL_DIGITS),
+                     literal_node<TYPE_TIMESTAMP_NS>(upper, 0,
+                                                     TimeStampNsValue::FRACTIONAL_DIGITS)})},
+            false, 0, TimeStampNsValue::FRACTIONAL_DIGITS);
+    std::shared_ptr<const std::vector<ParsedBoundary>> projected_list;
+    ASSERT_TRUE(list_parsed
+                        ->get_or_compute_projected_boundaries(
+                                /*filter_id=*/302, target_expr, SLOT_ID,
+                                /*leaf_column_id=*/0, directions, &ctx, &projected_list)
+                        .ok());
+    ASSERT_EQ(projected_list->size(), 1);
+    const auto& list =
+            std::get<ColumnValueRange<TYPE_TIMESTAMP_NS>>(projected_list->at(0).boundary_cvr);
+    EXPECT_TRUE(list.is_fixed_value_range());
+    EXPECT_TRUE(list.get_fixed_value_set().contains(lower));
+    EXPECT_TRUE(list.get_fixed_value_set().contains(upper));
+}
+
+TEST_F(RuntimeFilterPartitionPrunerTest, BloomPrunesListPartitionFixedValues) {
+    int32_t one = 1;
+    int32_t two = 2;
+    int32_t three = 3;
+    int32_t four = 4;
+    int32_t five = 5;
+    std::vector<TPartitionBoundary> boundaries {
+            list_boundary<TYPE_INT>(1, {literal_node<TYPE_INT>(one)}),
+            list_boundary<TYPE_INT>(2,
+                                    {literal_node<TYPE_INT>(two), literal_node<TYPE_INT>(three)}),
+            list_boundary<TYPE_INT>(3,
+                                    {literal_node<TYPE_INT>(four), literal_node<TYPE_INT>(five)})};
+    auto parsed = parse_boundaries(TYPE_INT, boundaries);
+    const auto& parsed_boundaries = parsed->slot_to_boundaries().at(SLOT_ID);
+
+    RuntimeFilterPartitionPruner pruner;
+    phmap::flat_hash_set<int64_t> pruned;
+    pruner._try_prune_by_single_rf(parsed_boundaries, bloom_predicate<TYPE_INT>({two}), pruned);
+    EXPECT_TRUE(pruned.contains(1));
+    EXPECT_FALSE(pruned.contains(2));
+    EXPECT_TRUE(pruned.contains(3));
+}
+
+TEST_F(RuntimeFilterPartitionPrunerTest, BloomPreservesListNullSemantics) {
+    int32_t one = 1;
+    int32_t two = 2;
+    std::vector<TPartitionBoundary> boundaries {
+            list_boundary<TYPE_INT>(1, {null_node(TYPE_INT)}),
+            list_boundary<TYPE_INT>(2, {null_node(TYPE_INT), literal_node<TYPE_INT>(one)}),
+            list_boundary<TYPE_INT>(3, {literal_node<TYPE_INT>(two)})};
+    auto parsed = parse_boundaries(TYPE_INT, boundaries, true);
+    const auto& parsed_boundaries = parsed->slot_to_boundaries().at(SLOT_ID);
+
+    RuntimeFilterPartitionPruner non_null_pruner;
+    phmap::flat_hash_set<int64_t> non_null_pruned;
+    non_null_pruner._try_prune_by_single_rf(parsed_boundaries, bloom_predicate<TYPE_INT>({one}),
+                                            non_null_pruned);
+    EXPECT_TRUE(non_null_pruned.contains(1));
+    EXPECT_FALSE(non_null_pruned.contains(2));
+    EXPECT_TRUE(non_null_pruned.contains(3));
+
+    RuntimeFilterPartitionPruner null_aware_pruner;
+    phmap::flat_hash_set<int64_t> null_aware_pruned;
+    null_aware_pruner._try_prune_by_single_rf(
+            parsed_boundaries, bloom_predicate<TYPE_INT>({one}, true), null_aware_pruned);
+    EXPECT_FALSE(null_aware_pruned.contains(1));
+    EXPECT_FALSE(null_aware_pruned.contains(2));
+    EXPECT_TRUE(null_aware_pruned.contains(3));
+}
+
+TEST_F(RuntimeFilterPartitionPrunerTest, BloomDoesNotPruneRangePartition) {
+    int32_t one = 1;
+    int32_t two = 2;
+    int32_t miss = 100;
+    std::vector<TPartitionBoundary> boundaries {range_boundary<TYPE_INT>(1, one, two)};
+    auto parsed = parse_boundaries(TYPE_INT, boundaries);
+    const auto& parsed_boundaries = parsed->slot_to_boundaries().at(SLOT_ID);
+    ASSERT_FALSE(parsed_boundaries[0].is_list_boundary);
+
+    RuntimeFilterPartitionPruner pruner;
+    phmap::flat_hash_set<int64_t> pruned;
+    pruner._try_prune_by_single_rf(parsed_boundaries, bloom_predicate<TYPE_INT>({miss}), pruned);
+    EXPECT_TRUE(pruned.empty());
 }
 
 TEST_F(RuntimeFilterPartitionPrunerTest, InvalidPartitionBoundaryRejected) {
@@ -433,13 +588,16 @@ TEST_F(RuntimeFilterPartitionPrunerTest, ParseAndPrunePrimitiveTypeMatrix) {
     assert_parse_and_prune_type<TYPE_CHAR>(String("aa"), String("bb"));
     assert_parse_and_prune_type<TYPE_VARCHAR>(String("alpha"), String("bravo"));
     assert_parse_and_prune_type<TYPE_STRING>(String("left"), String("right"));
-    assert_parse_and_prune_type<TYPE_DATE>(VecDateTimeValue(0, 2, 0, 0, 0, 2024, 1, 1),
-                                           VecDateTimeValue(0, 2, 0, 0, 0, 2024, 2, 1));
-    assert_parse_and_prune_type<TYPE_DATETIME>(VecDateTimeValue(0, 3, 0, 0, 0, 2024, 1, 1),
-                                               VecDateTimeValue(0, 3, 0, 0, 0, 2024, 2, 1));
+    assert_parse_and_prune_type<TYPE_DATE>(VecDateTimeValue(0, TIME_DATE, 0, 0, 0, 2024, 1, 1),
+                                           VecDateTimeValue(0, TIME_DATE, 0, 0, 0, 2024, 2, 1));
+    assert_parse_and_prune_type<TYPE_DATETIME>(
+            VecDateTimeValue(0, TIME_DATETIME, 0, 0, 0, 2024, 1, 1),
+            VecDateTimeValue(0, TIME_DATETIME, 0, 0, 0, 2024, 2, 1));
     assert_parse_and_prune_type<TYPE_DATEV2>(date_v2(2024, 1, 1), date_v2(2024, 2, 1));
     assert_parse_and_prune_type<TYPE_DATETIMEV2>(datetime_v2(2024, 1, 1), datetime_v2(2024, 2, 1),
                                                  0, 6);
+    assert_parse_and_prune_type<TYPE_TIMESTAMP_NS>(TimeStampNsValue(-1), TimeStampNsValue(1), 0,
+                                                   TimeStampNsValue::FRACTIONAL_DIGITS);
     assert_parse_and_prune_type<TYPE_TIMESTAMPTZ>(timestamptz(2024, 1, 1), timestamptz(2024, 2, 1),
                                                   0, 6);
     assert_parse_and_prune_type<TYPE_DECIMAL32>(Decimal32(100), Decimal32(200), 9, 2);

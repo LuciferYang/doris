@@ -27,6 +27,7 @@ import org.apache.doris.job.cdc.split.SnapshotSplit;
 import org.apache.doris.job.common.DataSourceType;
 import org.apache.doris.job.exception.JobException;
 import org.apache.doris.job.extensions.insert.streaming.StreamingInsertJob;
+import org.apache.doris.job.extensions.insert.streaming.StreamingJdbcUrlNormalizer;
 import org.apache.doris.job.offset.Offset;
 import org.apache.doris.job.util.StreamingJobUtils;
 import org.apache.doris.nereids.analyzer.UnboundTVFRelation;
@@ -95,6 +96,11 @@ public class JdbcTvfSourceOffsetProvider extends JdbcSourceOffsetProvider {
         super();
     }
 
+    @Override
+    public String getSourceType() {
+        return CdcStreamTableValuedFunction.NAME;
+    }
+
     /** Initializes provider state from TVF properties; called every schedule tick. */
     @Override
     public void ensureInitialized(Long jobId, Map<String, String> originTvfProps) throws JobException {
@@ -105,6 +111,8 @@ public class JdbcTvfSourceOffsetProvider extends JdbcSourceOffsetProvider {
         // Populate default slot/pub into sourceProperties so cleanMeta -> /api/close
         // carries the resolved names for cdcclient ownership-based cleanup.
         Map<String, String> effective = new HashMap<>(originTvfProps);
+        effective.put(DataSourceConfigKeys.JDBC_URL, StreamingJdbcUrlNormalizer.normalize(
+                resolvedType, effective.get(DataSourceConfigKeys.JDBC_URL)));
         StreamingJobUtils.populateDefaultSourceProperties(resolvedType, effective, String.valueOf(jobId));
         // Always refresh fields that may be updated via ALTER JOB (e.g. credentials, parallelism).
         this.sourceProperties = effective;
@@ -288,12 +296,20 @@ public class JdbcTvfSourceOffsetProvider extends JdbcSourceOffsetProvider {
                 }
             }
         } else {
-            // Mirror binlog offset into bop so it survives FE checkpoint
-            BinlogSplit bs = (BinlogSplit) newOffset.getSplits().get(0);
-            if (MapUtils.isNotEmpty(bs.getStartingOffset())) {
+            synchronized (splitsLock) {
+                // Mirror binlog offset into bop so it survives FE checkpoint
+                BinlogSplit bs = (BinlogSplit) newOffset.getSplits().get(0);
+                if (MapUtils.isEmpty(bs.getStartingOffset())) {
+                    log.warn("Skip empty committed binlog offset for job {}", getJobId());
+                    return;
+                }
                 binlogOffsetPersist = new HashMap<>(bs.getStartingOffset());
                 binlogOffsetPersist.put(SPLIT_ID, BinlogSplit.BINLOG_SPLIT_ID);
+                clearSnapshotState();
+                currentOffset = newOffset;
+                hasMoreData = true;
             }
+            return;
         }
         this.currentOffset = newOffset;
     }
@@ -420,9 +436,14 @@ public class JdbcTvfSourceOffsetProvider extends JdbcSourceOffsetProvider {
         return remapped;
     }
 
+    @Override
+    public String mergePersistInfo(String previousPersistInfo, String incomingPersistInfo) {
+        // TVF records contain complete state rather than schema-omitting CDC updates.
+        return incomingPersistInfo;
+    }
+
     /**
-     * Restore chw/bop/ts from the image-persisted JSON. Called by gsonPostProcess on FE startup
-     * before any journal replay; recovers state lost when pre-checkpoint journal is GC'd.
+     * Restore chw/bop/ts from image or job update journal JSON; preserves cumulative snapshot progress.
      */
     @Override
     public void restoreFromPersistInfo(String persistInfo) {
@@ -434,6 +455,10 @@ public class JdbcTvfSourceOffsetProvider extends JdbcSourceOffsetProvider {
             this.chunkHighWatermarkMap = tmp.getChunkHighWatermarkMap();
             this.binlogOffsetPersist = tmp.getBinlogOffsetPersist();
             this.tableSchemas = tmp.getTableSchemas();
+            if (MapUtils.isNotEmpty(binlogOffsetPersist)) {
+                this.currentOffset = new JdbcOffset(
+                        Collections.singletonList(new BinlogSplit(binlogOffsetPersist)));
+            }
             log.info("Restored TVF offset provider from persist: chw={}, bop={}, ts.len={}",
                     chunkHighWatermarkMap == null ? 0 : chunkHighWatermarkMap.size(),
                     binlogOffsetPersist == null ? 0 : binlogOffsetPersist.size(),

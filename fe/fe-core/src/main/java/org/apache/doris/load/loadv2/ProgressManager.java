@@ -52,11 +52,10 @@ public class ProgressManager {
     }
 
     public void updateProgress(String id, TUniqueId queryId, TUniqueId fragmentId, int finishedScannerNum) {
+        // INSERT jobs do not register scan progress, and bulk load reports can arrive after cleanup.
         Progress progress = idToProgress.get(id);
         if (progress != null) {
             progress.updateFinishedScanNums(queryId, fragmentId, finishedScannerNum);
-        } else {
-            LOG.warn("progress[" + id + "] missing meta information");
         }
     }
 

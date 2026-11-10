@@ -65,6 +65,35 @@ suite("query_stats_test") {
     // Counts may exceed 1 in multi-FE clusters; verify right columns hit, wrong ones stay 0.
     sql "select k1 from ${tbName} where k0 = 1"
     sql "select k4 from ${tbName} where k2 = 1991"
+    // Explicit database-level query stats should use the
+    // same result schema as implicit database-level stats.
+    def currentDb = sql("SELECT DATABASE()")[0][0].toString()
+
+    def implicitDbStats =
+            sql_return_maparray "SHOW QUERY STATS"
+
+    def explicitDbStats =
+            sql_return_maparray "SHOW QUERY STATS FOR ${currentDb}"
+
+    def implicitRow = implicitDbStats.find {
+        it.TableName == tbName
+    }
+    def explicitRow = explicitDbStats.find {
+        it.TableName == tbName
+    }
+
+    assertNotNull(implicitRow)
+    assertNotNull(explicitRow)
+
+    assertEquals(
+            ["TableName", "QueryCount"] as Set,
+            explicitRow.keySet() as Set
+    )
+
+    assertEquals(
+            implicitRow.keySet() as Set,
+            explicitRow.keySet() as Set
+    )
     def stats1 = sql "show query stats from ${tbName}"
     def s1k1 = stats1.find { it[0] == "k1" }
     def s1k0 = stats1.find { it[0] == "k0" }
@@ -197,6 +226,78 @@ suite("query_stats_test") {
     sql "select a.k1 from ${tbName} a, ${tbName} b where a.k1 = b.k1"
     def joinResult = sql "show query stats from ${tbName} all"
     assertTrue((joinResult[0][1] as int) >= 1)
+
+    // UNION ALL: both branches contribute queryHit for k1; WHERE on right branch adds k2.filterHit.
+    sql "clean all query stats"
+    sql "select k1 from ${tbName} union all select k1 from ${tbName} where k2 = 100"
+    def unionStats = sql "show query stats from ${tbName}"
+    def uK1 = unionStats.find { it[0] == "k1" }
+    def uK2 = unionStats.find { it[0] == "k2" }
+    assertNotNull(uK1)
+    assertNotNull(uK2)
+    assertTrue((uK1[1] as int) >= 1, "k1: UNION ALL queryHit")
+    assertTrue((uK2[2] as int) >= 1, "k2: WHERE on right UNION branch filterHit")
+
+    // HAVING: k1 queryHit from GROUP BY + SELECT, k2 queryHit from SUM input,
+    // k2 filterHit from HAVING SUM(k2) > -1000.
+    sql "clean all query stats"
+    sql "select k1, sum(k2) from ${tbName} group by k1 having sum(k2) > -1000"
+    def havingStats = sql "show query stats from ${tbName}"
+    def hvK1 = havingStats.find { it[0] == "k1" }
+    def hvK2 = havingStats.find { it[0] == "k2" }
+    assertNotNull(hvK1)
+    assertNotNull(hvK2)
+    assertTrue((hvK1[1] as int) >= 1, "k1: GROUP BY / SELECT queryHit")
+    assertTrue((hvK2[1] as int) >= 1, "k2: SUM aggregate input queryHit")
+    assertTrue((hvK2[2] as int) >= 1, "k2: HAVING SUM(k2) filterHit")
+
+    // CTE: consumer query records queryHit on k2 and filterHit on k1.
+    // Force materialization so the plan keeps PhysicalCTEProducer/Consumer instead of
+    // CTEInline collapsing the single-reference CTE into a plain scan+filter.
+    sql "clean all query stats"
+    sql "set inline_cte_referenced_threshold = 0"
+    sql """with cte as (select k2 from ${tbName} where k1 = 1) select k2 from cte"""
+    sql "set inline_cte_referenced_threshold = 1"
+    def cteStats = sql "show query stats from ${tbName}"
+    def cteK2 = cteStats.find { it[0] == "k2" }
+    def cteK1 = cteStats.find { it[0] == "k1" }
+    assertNotNull(cteK2)
+    assertNotNull(cteK1)
+    assertTrue((cteK2[1] as int) >= 1, "k2: CTE consumer queryHit")
+    assertTrue((cteK1[2] as int) >= 1, "k1: CTE WHERE filterHit")
+
+    // LATERAL VIEW / EXPLODE: the generator input column (k7, a varchar) gets queryHit
+    // because it is the source expression fed into the generator; the synthetic output
+    // slot (e1) is skipped by the PhysicalGenerate handler.
+    sql "clean all query stats"
+    sql "select e1 from ${tbName} lateral view explode_split(k7, ',') tmp as e1"
+    def lateralStats = sql "show query stats from ${tbName}"
+    def lvK7 = lateralStats.find { it[0] == "k7" }
+    assertNotNull(lvK7, "k7 must appear after LATERAL VIEW EXPLODE_SPLIT")
+    assertTrue((lvK7[1] as int) >= 1, "k7: LATERAL VIEW input column queryHit")
+
+    // Table-function join ON predicate: PhysicalGenerate.getConjuncts() is sent straight to
+    // TableFunctionNode and actually filters at execution — must record filterHit too.
+    // The predicate must reference a real column (k7), not just the generator's own
+    // synthetic output (val) — filtering on val alone has no scan column to attribute to.
+    sql "clean all query stats"
+    sql """select s.val from ${tbName} left join lateral unnest(split(k7, ',')) s(val) on k7 != ''"""
+    def genStats = sql "show query stats from ${tbName}"
+    def genK7 = genStats.find { it[0] == "k7" }
+    assertNotNull(genK7)
+    assertTrue((genK7[2] as int) >= 1, "k7: table-function join ON predicate filterHit")
+
+    // Computed SELECT: SELECT k1+k2 — both input columns get queryHit even though
+    // the output expression is not a plain slot reference.
+    sql "clean all query stats"
+    sql "select k1 + k2 from ${tbName}"
+    def computedStats = sql "show query stats from ${tbName}"
+    def cmpK1 = computedStats.find { it[0] == "k1" }
+    def cmpK2 = computedStats.find { it[0] == "k2" }
+    assertNotNull(cmpK1, "k1 must appear in computed SELECT k1+k2")
+    assertNotNull(cmpK2, "k2 must appear in computed SELECT k1+k2")
+    assertTrue((cmpK1[1] as int) >= 1, "k1: computed SELECT queryHit")
+    assertTrue((cmpK2[1] as int) >= 1, "k2: computed SELECT queryHit")
 
     sql "admin set all frontends config (\"enable_query_hit_stats\"=\"false\");"
     sql "set enable_nereids_planner = ${origNereids}"

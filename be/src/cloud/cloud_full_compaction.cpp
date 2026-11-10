@@ -19,6 +19,7 @@
 
 #include <gen_cpp/cloud.pb.h>
 
+#include <algorithm>
 #include <boost/container_hash/hash.hpp>
 
 #include "cloud/cloud_meta_mgr.h"
@@ -113,7 +114,7 @@ Status CloudFullCompaction::request_global_lock() {
     if (!st.ok()) {
         if (resp.status().code() == cloud::STALE_TABLET_CACHE) {
             // set last_sync_time to 0 to force sync tablet next time
-            cloud_tablet()->last_sync_time_s = 0;
+            cloud_tablet()->last_sync_rowsets_time_s = 0;
         } else if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
             // tablet not found
             cloud_tablet()->clear_cache();
@@ -128,18 +129,24 @@ Status CloudFullCompaction::pick_rowsets_to_compact() {
         std::shared_lock rlock(_tablet->get_header_lock());
         _base_compaction_cnt = cloud_tablet()->base_compaction_cnt();
         _cumulative_compaction_cnt = cloud_tablet()->cumulative_compaction_cnt();
-        _input_rowsets = cloud_tablet()->pick_candidate_rowsets_to_full_compaction();
+        _input_rowsets = cloud_tablet()->pick_candidate_rowsets_to_full_compaction_unlocked();
     }
     if (auto st = check_version_continuity(_input_rowsets); !st.ok()) {
         DCHECK(false) << st;
         return st;
     }
-    if (_input_rowsets.size() <= 1) {
+    // An already compacted rowset can expire later without another write. Full compaction
+    // is also the explicit TTL GC operation, including the initial [0-1], [2-y] layout.
+    const bool ttl_gc = _tablet->tablet_schema()->has_ttl_col() &&
+                        std::ranges::any_of(_input_rowsets, [](const auto& rowset) {
+                            return rowset->num_rows() > 0;
+                        });
+    if (_input_rowsets.size() <= 1 && !ttl_gc) {
         return Status::Error<BE_NO_SUITABLE_VERSION>(
                 "insufficent compaction input rowset, #rowsets={}", _input_rowsets.size());
     }
 
-    if (_input_rowsets.size() == 2 && _input_rowsets[0]->end_version() == 1) {
+    if (_input_rowsets.size() == 2 && _input_rowsets[0]->end_version() == 1 && !ttl_gc) {
         // the tablet is with rowset: [0-1], [2-y]
         // and [0-1] has no data. in this situation, no need to do full compaction.
         return Status::Error<BE_NO_SUITABLE_VERSION>("no suitable versions for compaction");

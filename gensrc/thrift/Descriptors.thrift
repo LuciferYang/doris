@@ -64,10 +64,17 @@ struct TMetaAccessPath {
   1: required list<string> path
 }
 
+const i32 TCOLUMN_ACCESS_PATH_VERSION_LEGACY = 0
+const i32 TCOLUMN_ACCESS_PATH_VERSION_TYPED = 1
+
 struct TColumnAccessPath {
   1: required TAccessPathType type
   2: optional TDataAccessPath data_access_path
   3: optional TMetaAccessPath meta_access_path
+  // The version is absent for legacy senders. Legacy paths all have DATA type and encode
+  // KEYS/VALUES/* selectors plus NULL/OFFSET metadata in data_access_path. Starting from the
+  // typed version, type selects the authoritative payload and META may use meta_access_path.
+  4: optional i32 version
 }
 
 struct TColumn {
@@ -100,6 +107,9 @@ struct TColumn {
   27: optional i64 variant_doc_materialization_min_rows
   28: optional i32 variant_doc_hash_shard_count
   29: optional bool variant_enable_nested_group
+  // Dynamic default expression retained separately when default_value is a schema-change
+  // backfill literal. New writes must evaluate this expression at write time.
+  30: optional string default_value_expr
 }
 
 struct TSlotDescriptor {
@@ -142,7 +152,7 @@ enum THdfsFileFormat {
   LZO_TEXT = 1,
   RC_FILE = 2,
   SEQUENCE_FILE =3,
-  AVRO = 4,
+  AVRO = 4, // Deprecated: reading this format is no longer supported.
   PARQUET = 5
 }
 
@@ -209,17 +219,19 @@ enum TSchemaTableType {
     SCH_SQL_BLOCK_RULE_STATUS = 59;
     SCH_CLUSTER_SNAPSHOTS = 60;
     SCH_CLUSTER_SNAPSHOT_PROPERTIES = 61;
-    SCH_BLACKHOLE = 62;
-    SCH_COLUMN_DATA_SIZES = 63;
-    SCH_LOAD_JOBS = 64;
-    SCH_FILE_CACHE_INFO = 65;
-    SCH_DATABASE_PROPERTIES = 66;
-    SCH_AUTHENTICATION_INTEGRATIONS = 67;
-    SCH_TABLE_STREAMS = 68;
-    SCH_TABLE_STREAM_CONSUMPTION = 69;
-    SCH_BE_COMPACTION_TASKS = 70;
-    SCH_ROLE_MAPPINGS = 71;
-    SCH_BACKEND_MS_RPC_TABLE_THROTTLERS = 72;
+    SCH_FILE_CACHE_INFO = 62;
+    SCH_BLACKHOLE = 63;
+    SCH_COLUMN_DATA_SIZES = 64;
+    SCH_LOAD_JOBS = 65;
+    SCH_AUTHENTICATION_INTEGRATIONS = 66;
+    SCH_BE_COMPACTION_TASKS = 67;
+    SCH_ROLE_MAPPINGS = 68;
+    SCH_BACKEND_MS_RPC_TABLE_THROTTLERS = 69;
+    SCH_DATABASE_PROPERTIES = 70;
+    SCH_TABLE_STREAMS = 71;
+    SCH_TABLE_STREAM_CONSUMPTION = 72;
+    SCH_EXTENSIONS = 73;
+    SCH_TSO_STATUS = 74;
 }
 
 enum THdfsCompression {
@@ -259,6 +271,10 @@ const map<string, THdfsCompression> COMPRESSION_MAP = {
 struct TOlapTableIndexTablets {
     1: required i64 index_id
     2: required list<i64> tablets
+    // only used in adaptive random bucket mode: FE-selected bucket owner BE for this index.
+    3: optional i64 bucket_be_id
+    // only used in adaptive random bucket mode: FE-selected bucket seqs for this index.
+    4: optional list<i32> local_bucket_seqs
 }
 
 // its a closed-open range
@@ -279,13 +295,20 @@ struct TOlapTablePartition {
     9: optional bool is_mutable = true
     // only used in List Partition
     10: optional bool is_default_partition;
-    // only used in random distribution scenario to make data distributed even 
+    // only used in random distribution scenario:
+    // - legacy mode: global round-robin index / fixed bucket index
+    // - adaptive random bucket mode: FE-selected starting bucket seq for this sink
     11: optional i64 load_tablet_idx
     12: optional i32 total_replica_num
     13: optional i32 load_required_replica_num
     // tablet_id -> list of backend_ids that have version gaps (lastFailedVersion >= 0)
     // used by BE to exclude these backends from success counting in majority write
     14: optional map<i64, list<i64>> tablet_version_gap_backends
+    // only used in adaptive random bucket mode: FE-selected bucket owner BE for this sink
+    15: optional i64 bucket_be_id
+    // only used in adaptive random bucket mode: FE-selected bucket seqs for this sink.
+    // When set, BE uses them directly and skips recomputing from tablet locations.
+    16: optional list<i32> local_bucket_seqs
 }
 
 struct TOlapTablePartitionParam {
@@ -332,7 +355,8 @@ struct TOlapTableIndexSchema {
     4: optional list<TColumn> columns_desc
     5: optional list<TOlapTableIndex> indexes_desc
     6: optional Exprs.TExpr where_clause
-    7: optional i64 row_binlog_id
+    // ATTN(changelog-rename): formerly "row_binlog_id"
+    7: optional i64 changelog_index_id
 }
 
 struct TOlapTableSchemaParam {
@@ -354,12 +378,18 @@ struct TOlapTableSchemaParam {
     14: optional Types.TUniqueKeyUpdateMode unique_key_update_mode
     15: optional i32 sequence_map_col_unique_id = -1
     16: optional TPartialUpdateNewRowPolicy partial_update_new_key_policy
-    17: optional TOlapTableIndexSchema row_binlog_index_schema
+    // ATTN(changelog-rename): formerly "row_binlog_index_schemas"
+    17: optional list<TOlapTableIndexSchema> changelog_index_schemas
+    // Unused: row TTL tables reject partial updates. Keep these field IDs for compatibility.
+    18: optional i32 row_ttl_source_column_unique_id = -1
+    19: optional TColumn row_ttl_source_column
 }
 
 struct TTabletLocation {
     1: required i64 tablet_id
     2: required list<i64> node_ids
+    // used to write changelog tablet by base tablet with the same bucket idx
+    3: optional i64 base_tablet_id
 }
 
 struct TOlapTableLocationParam {
@@ -472,6 +502,7 @@ struct TTrinoConnectorTable {
   3: optional map<string, string> properties
 }
 
+// Deprecated: the associated external table read support has been removed.
 struct TLakeSoulTable {
   1: optional string db_name
   2: optional string table_name
@@ -511,7 +542,7 @@ struct TTableDescriptor {
   20: optional TJdbcTable jdbcTable
   21: optional TMCTable mcTable
   22: optional TTrinoConnectorTable trinoConnectorTable
-  23: optional TLakeSoulTable lakesoulTable
+  23: optional TLakeSoulTable lakesoulTable // Deprecated: reading this format is no longer supported.
   24: optional TDictionaryTable dictionaryTable
   25: optional TRemoteDorisTable remoteDorisTable
 }

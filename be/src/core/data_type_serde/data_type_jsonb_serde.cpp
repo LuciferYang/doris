@@ -22,8 +22,11 @@
 #include <memory>
 
 #include "arrow/array/builder_binary.h"
+#include "common/config.h"
 #include "common/exception.h"
 #include "common/status.h"
+#include "core/data_type_serde/arrow_validation.h"
+#include "core/data_type_serde/bson_value_view.h"
 #include "core/value/jsonb_value.h"
 #include "exprs/json_functions.h"
 #include "util/jsonb_parser_simd.h"
@@ -99,8 +102,7 @@ Status DataTypeJsonbSerDe::write_column_to_arrow(const IColumn& column, const Nu
     auto& builder = assert_cast<arrow::StringBuilder&>(*array_builder);
     for (size_t string_i = start; string_i < end; ++string_i) {
         if (null_map && (*null_map)[string_i]) {
-            RETURN_IF_ERROR(checkArrowStatus(builder.AppendNull(), column.get_name(),
-                                             array_builder->type()->name()));
+            RETURN_IF_ERROR(checkArrowStatus(builder.AppendNull(), column, *array_builder));
             continue;
         }
         std::string_view string_ref = string_column.get_data_at(string_i).to_string_view();
@@ -109,7 +111,7 @@ Status DataTypeJsonbSerDe::write_column_to_arrow(const IColumn& column, const Nu
         RETURN_IF_ERROR(
                 checkArrowStatus(builder.Append(json_string.data(),
                                                 cast_set<int, size_t, false>(json_string.size())),
-                                 column.get_name(), array_builder->type()->name()));
+                                 column, *array_builder));
     }
     return Status::OK();
 }
@@ -117,6 +119,9 @@ Status DataTypeJsonbSerDe::write_column_to_arrow(const IColumn& column, const Nu
 Status DataTypeJsonbSerDe::read_column_from_arrow(IColumn& column, const arrow::Array* arrow_array,
                                                   int64_t start, int64_t end,
                                                   const cctz::time_zone& ctz) const {
+    if (config::enable_arrow_input_validation) {
+        check_arrow_no_offset(*arrow_array);
+    }
     if (arrow_array->type_id() == arrow::Type::STRING ||
         arrow_array->type_id() == arrow::Type::BINARY) {
         const auto* concrete_array = dynamic_cast<const arrow::BinaryArray*>(arrow_array);
@@ -145,12 +150,11 @@ Status DataTypeJsonbSerDe::read_column_from_arrow(IColumn& column, const arrow::
     } else if (arrow_array->type_id() == arrow::Type::FIXED_SIZE_BINARY) {
         const auto* concrete_array = dynamic_cast<const arrow::FixedSizeBinaryArray*>(arrow_array);
         uint32_t width = concrete_array->byte_width();
-        const auto* array_data = concrete_array->GetValue(start);
 
         JsonBinaryValue value;
-        for (size_t offset_i = 0; offset_i < end - start; ++offset_i) {
+        for (auto offset_i = start; offset_i < end; ++offset_i) {
             if (!concrete_array->IsNull(offset_i)) {
-                const auto* raw_data = array_data + (offset_i * width);
+                const auto* raw_data = concrete_array->GetValue(offset_i);
 
                 RETURN_IF_ERROR(
                         value.from_json_string(reinterpret_cast<const char*>(raw_data), width));
@@ -262,7 +266,8 @@ Status DataTypeJsonbSerDe::read_column_from_pb(IColumn& column, const PValues& a
 }
 
 Status DataTypeJsonbSerDe::serialize_column_to_jsonb(const IColumn& from_column, int64_t row_num,
-                                                     JsonbWriter& writer) const {
+                                                     JsonbWriter& writer,
+                                                     const FormatOptions& options) const {
     const auto& jsonb_binary = assert_cast<const ColumnString&>(from_column).get_data_at(row_num);
     const JsonbDocument* doc = nullptr;
     RETURN_IF_ERROR(
@@ -292,6 +297,20 @@ Status DataTypeJsonbSerDe::from_string(StringRef& str, IColumn& column,
                                        const FormatOptions& options) const {
     auto slice = str.to_slice();
     return deserialize_one_cell_from_json(column, slice, options);
+}
+
+Status DataTypeJsonbSerDe::from_string_as_nested(StringRef& str, IColumn& column,
+                                                 const FormatOptions& options,
+                                                 bool is_strict_mode) const {
+    // Quotes belong to the JSON value: stripping them turns "123" into a number
+    // and "null" into JSON null, losing the original type.
+    auto token = str;
+    // SQL apostrophes are an optional outer wrapper, e.g. '{"a":1}' or '"123"'.
+    if (token.size >= 2 && token.front() == '\'' && token.back() == '\'') {
+        token = token.substring(1, token.size - 2);
+    }
+    return is_strict_mode ? from_string_strict_mode(token, column, options)
+                          : from_string(token, column, options);
 }
 
 void DataTypeJsonbSerDe::write_one_cell_to_binary(const IColumn& src_column,
@@ -337,14 +356,10 @@ void DataTypeJsonbSerDe::to_string(const IColumn& column, size_t row_num, Buffer
     const auto& col = assert_cast<const ColumnString&, TypeCheckOnRelease::DISABLE>(column);
     const auto& data_ref = col.get_data_at(row_num);
     if (data_ref.size > 0) {
-        if (_nesting_level > 1) {
-            bw.write('"');
-        }
+        // JSON text already quotes strings and escapes their contents. Wrapping a nested
+        // object again would produce invalid text such as ["{"a":1}"].
         std::string str = JsonbToJson::jsonb_to_json_string(data_ref.data, data_ref.size);
         bw.write(str.c_str(), str.size());
-        if (_nesting_level > 1) {
-            bw.write('"');
-        }
     } else {
         bw.write("NULL", 4);
     }
@@ -362,6 +377,17 @@ bool DataTypeJsonbSerDe::write_column_to_presto_text(const IColumn& column, Buff
         bw.write("NULL", 4);
     }
     return true;
+}
+
+Status DataTypeJsonbSerDe::decode_bson_value(IColumn& column, const BsonValueView& value,
+                                             const BsonDecodeContext& context) const {
+    RETURN_IF_ERROR(context.validate(value));
+    std::string json;
+    RETURN_IF_ERROR(bson_canonical_json(value, &json));
+    Slice slice(json);
+    Status status = deserialize_one_cell_from_json(column, slice, FormatOptions());
+    return status.ok() ? status
+                       : Status::InvalidArgument("BSON Extended JSON exceeds JSONB limits");
 }
 
 } // namespace doris

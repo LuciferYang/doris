@@ -34,7 +34,13 @@ public:
     DataTypeNullableSerDe(const DataTypeSerDeSPtr& _nested_serde, int nesting_level = 1)
             : DataTypeSerDe(nesting_level), nested_serde(_nested_serde) {}
 
+    Status decode_bson_value(IColumn& column, const BsonValueView& value,
+                             const BsonDecodeContext& context) const override;
+
     std::string get_name() const override { return "Nullable(" + nested_serde->get_name() + ")"; }
+
+    Status from_string_as_nested(StringRef& str, IColumn& column, const FormatOptions& options,
+                                 bool is_strict_mode) const override;
 
     Status from_string(StringRef& str, IColumn& column,
                        const FormatOptions& options) const override;
@@ -50,6 +56,8 @@ public:
                                     BufferWritable& bw, FormatOptions& options) const override;
     Status deserialize_one_cell_from_json(IColumn& column, Slice& slice,
                                           const FormatOptions& options) const override;
+    Status deserialize_one_cell_from_csv(IColumn& column, Slice& slice,
+                                         const FormatOptions& options) const override;
 
     Status deserialize_column_from_json_vector(IColumn& column, std::vector<Slice>& slices,
                                                uint64_t* num_deserialized,
@@ -84,8 +92,21 @@ public:
     Status write_column_to_arrow(const IColumn& column, const NullMap* null_map,
                                  arrow::ArrayBuilder* array_builder, int64_t start, int64_t end,
                                  const cctz::time_zone& ctz) const override;
+    Status write_column_to_paimon_arrow(const std::shared_ptr<const IDataType>& type,
+                                        const IColumn& column, const NullMap* null_map,
+                                        const std::shared_ptr<arrow::Field>& field,
+                                        arrow::ArrayBuilder* array_builder, int64_t start,
+                                        int64_t end, const cctz::time_zone& ctz) const override;
+    Status write_column_to_iceberg_arrow(const std::shared_ptr<const IDataType>& type,
+                                         const IColumn& column, const NullMap* null_map,
+                                         const std::shared_ptr<arrow::Field>& field,
+                                         arrow::ArrayBuilder* array_builder, int64_t start,
+                                         int64_t end, const cctz::time_zone& ctz) const override;
     Status read_column_from_arrow(IColumn& column, const arrow::Array* arrow_array, int64_t start,
                                   int64_t end, const cctz::time_zone& ctz) const override;
+    Status read_column_from_decoded_values(IColumn& column,
+                                           const DecodedColumnView& view) const override;
+    Status read_column_from_orc(IColumn& column, const OrcDecodedColumnView& view) const override;
     Status write_column_to_mysql_binary(const IColumn& column, MysqlRowBinaryBuffer& row_buffer,
                                         int64_t row_idx, bool col_const,
                                         const FormatOptions& options) const override;
@@ -109,7 +130,8 @@ public:
     }
 
     Status serialize_column_to_jsonb(const IColumn& from_column, int64_t row_num,
-                                     JsonbWriter& writer) const override;
+                                     JsonbWriter& writer,
+                                     const FormatOptions& options) const override;
 
     Status deserialize_column_from_jsonb(IColumn& column, const JsonbValue* jsonb_value,
                                          CastParameters& castParms) const override;

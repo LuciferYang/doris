@@ -77,7 +77,6 @@ excludeSuites = "000_the_start_sentinel_do_not_touch," + // keep this line as th
     "test_refresh_mtmv," +
     "test_spark_load," +
     "test_paimon_gcs," +
-    "test_broker_load_func," +
     "test_stream_stub_fault_injection," +
     "test_iceberg_overwrite_with_wrong_partition," +
     "zzz_the_end_sentinel_do_not_touch" // keep this line as the last line
@@ -140,11 +139,24 @@ hive3PgPort=5732
 // See `docker/thirdparties/start-thirdparties-docker.sh`
 enableKafkaTest=true
 kafka_port=19193
+
+// The external regression pipeline starts the fluss component for these suites.
+enableFlussTest=true
+fluss_coordinator_port=19123
+// The object store the tiered half of a fluss table lives in; the suites give
+// its endpoint and the minio default credentials to their own catalog, because
+// fluss strips every credential-bearing option before answering a client.
+fluss_minio_port=19125
 // refactor params
 enableRefactorParamsTest=true
 
 // iceberg test config
 iceberg_rest_uri_port=18181
+iceberg_scan_planning_rest_uri_port=18182
+// Avoid the hms_port suffix: shared CI rewrites it for the default Hive service.
+iceberg_encryption_metastore_port=18383
+iceberg_encryption_kms_port=18384
+iceberg_encryption_fixture_port=18385
 iceberg_rest_uri_port_s3=19181
 iceberg_rest_uri_port_oss=19182
 iceberg_rest_uri_port_cos=19183
@@ -191,6 +203,7 @@ oracle_11_port=1521
 sqlserver_2022_port=1433
 clickhouse_22_port=8123
 oceanbase_port=2881
+oceanbase_cdc_port=2883
 db2_11_port=50000
 
 // trino-connector catalog test config
@@ -203,9 +216,6 @@ kerberosHdfsPort=8820
 enableNonCatalogKerberosTest = true
 
 
-// LakeSoul catalog test config
-enableLakesoulTest = true
-
 // AWS iam role config
 
 // hudi p0 external regression test config
@@ -217,3 +227,17 @@ hudiHmsPort=19083
 hudiMinioPort=19100
 hudiMinioAccessKey="minio"
 hudiMinioSecretKey="minio123"
+
+// Keep rootless CI exclusions opt-in; other external-test environments are unchanged.
+if (System.getenv("DORIS_CI_PRISTINE_FRAMEWORK") == "true") {
+    // Temporary environment exclusions using the existing suite-name filter.
+    // Re-enable after the rootless execution prerequisites are reviewed and validated.
+    excludeSuites += "," + [
+        // sudo/Docker fixture; requires case changes for rootless CI
+        "test_single_hive_kerberos",
+        // sudo/Docker fixture; requires case changes for rootless CI
+        "test_two_hive_kerberos",
+        // root SSH/SCP or remote filesystem prerequisite
+        "test_parquet_meta_tvf"
+    ].join(",")
+}

@@ -17,9 +17,11 @@
 
 package org.apache.doris.system;
 
+import org.apache.doris.catalog.ColocateTableIndex.GroupId;
 import org.apache.doris.catalog.DiskInfo;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ReplicaAllocation;
+import org.apache.doris.catalog.TabletSlidingWindowAccessStats;
 import org.apache.doris.cloud.qe.ComputeGroupException;
 import org.apache.doris.cluster.ClusterGuard;
 import org.apache.doris.cluster.ClusterGuardException;
@@ -95,6 +97,9 @@ public class SystemInfoService {
     protected volatile ImmutableMap<Long, AtomicLong> idToReportVersionRef = ImmutableMap.of();
 
     private volatile ImmutableMap<Long, DiskInfo> pathHashToDiskInfoRef = ImmutableMap.of();
+
+    public void invalidateCloudColocatePlacement(GroupId groupId) {
+    }
 
     public static class HostInfo implements Comparable<HostInfo> {
         public String host;
@@ -301,6 +306,7 @@ public class SystemInfoService {
         copiedReportVersions.remove(droppedBackend.getId());
         ImmutableMap<Long, AtomicLong> newIdToReportVersion = ImmutableMap.copyOf(copiedReportVersions);
         idToReportVersionRef = newIdToReportVersion;
+        TabletSlidingWindowAccessStats.getInstance().removeBackend(droppedBackend.getId());
 
         // log
         Env.getCurrentEnv().getEditLog().logDropBackend(droppedBackend);
@@ -328,6 +334,10 @@ public class SystemInfoService {
     }
 
     public Backend getBackend(long backendId) {
+        return getAllClusterBackendsNoException().get(backendId);
+    }
+
+    public Backend getBackendByIdWithBoxedId(Long backendId) {
         return getAllClusterBackendsNoException().get(backendId);
     }
 
@@ -846,6 +856,7 @@ public class SystemInfoService {
         copiedReportVersions.remove(backend.getId());
         ImmutableMap<Long, AtomicLong> newIdToReportVersion = ImmutableMap.copyOf(copiedReportVersions);
         idToReportVersionRef = newIdToReportVersion;
+        TabletSlidingWindowAccessStats.getInstance().removeBackend(backend.getId());
 
     }
 

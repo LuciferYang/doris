@@ -256,6 +256,9 @@ public class TxnUtil {
         if (rtTaskTxnCommitAttachment.getErrorLogUrl() != null) {
             builder.setErrorLogUrl(rtTaskTxnCommitAttachment.getErrorLogUrl());
         }
+        if (rtTaskTxnCommitAttachment.getFirstErrorMsg() != null) {
+            builder.setFirstErrorMsg(rtTaskTxnCommitAttachment.getFirstErrorMsg());
+        }
 
         attachementBuilder.setRlTaskTxnCommitAttachment(builder.build());
         return attachementBuilder.build();
@@ -405,6 +408,7 @@ public class TxnUtil {
                 commitTime,
                 finishTime
         );
+        transactionState.setCommitTSO(txnInfo.hasCommitTso() ? txnInfo.getCommitTso() : -1);
         if (LOG.isDebugEnabled()) {
             LOG.debug("transactionState={}", transactionState);
         }
